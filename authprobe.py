@@ -17,7 +17,7 @@ import sys
 import warnings
 from urllib.parse import urlparse
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # Suppress SSL warnings for testing
 warnings.filterwarnings("ignore")
@@ -172,6 +172,20 @@ _CRED_FIELD_COMBOS = [
     ("name",     "password"),
 ]
 
+# Field names to try when submitting a TOTP/OTP code
+_MFA_CODE_FIELDS = [
+    "code", "token", "otp", "totp", "mfa_code", "totp_code",
+    "passcode", "pin", "one_time_password",
+]
+
+# Path suffixes appended to the parent of the login path when probing for MFA endpoint
+_MFA_SUBMISSION_SUFFIXES = [
+    "/mfa", "/2fa", "/otp", "/totp", "/verify",
+    "/mfa/verify", "/mfa/validate", "/mfa/confirm",
+    "/2fa/verify", "/auth/mfa", "/auth/2fa", "/auth/otp",
+    "/auth/verify", "/auth/totp",
+]
+
 
 # ─────────────────────────────────────────────────────────────
 # HTTP helpers
@@ -281,6 +295,213 @@ def _split_url(url: str) -> tuple[str, str, str]:
 
 def _is_login_path(path: str) -> bool:
     return bool(_LOGIN_PATH_RE.search(path))
+
+
+# ─────────────────────────────────────────────────────────────
+# TOTP / MFA helpers
+# ─────────────────────────────────────────────────────────────
+
+def _generate_totp(secret: str) -> "str | None":
+    """Generate current TOTP code using pyotp. Returns None if pyotp unavailable."""
+    try:
+        import pyotp
+        return pyotp.TOTP(secret.strip().upper()).now()
+    except ImportError:
+        return None
+    except Exception:
+        return None
+
+
+def _extract_mfa_cookie(body: "dict | None", resp) -> "tuple[str, str]":
+    """Return (cookie_name, cookie_value) from an MFA challenge response.
+
+    Checks (in order):
+    1. body["mfaCookie"] or body["data"]["mfaCookie"] — value is "NAME=JWT" or bare JWT
+    2. body["mfa_cookie"] / body["data"]["mfa_cookie"]
+    3. Set-Cookie response headers matching MFA name patterns
+    """
+    _mfa_keys = ("mfaCookie", "mfa_cookie", "mfa_token", "challengeCookie")
+    _sources: list = [body or {}]
+    if isinstance((body or {}).get("data"), dict):
+        _sources.append(body["data"])
+
+    for src in _sources:
+        for key in _mfa_keys:
+            val = src.get(key, "")
+            if val and isinstance(val, str):
+                if "=" in val and not val.startswith("eyJ"):
+                    # "NAME=VALUE" format
+                    name, _, value = val.partition("=")
+                    return name.strip(), value.strip()
+                # Bare JWT — use the key name as cookie name
+                return key, val
+
+    # Fallback: inspect Set-Cookie headers
+    if resp is not None:
+        for raw in resp.headers.get("Set-Cookie", "").split(","):
+            part = raw.strip().split(";")[0]  # cookie name=value only
+            if re.search(r'(2fa|mfa|otp|totp|challenge)', part, re.I) and "=" in part:
+                name, _, value = part.partition("=")
+                return name.strip(), value.strip()
+    return "", ""
+
+
+def _extract_default_totp_id(body: "dict | None") -> str:
+    """Return the ID of the TOTP authenticator from a challenge body, or ''."""
+    if not isinstance(body, dict):
+        return ""
+    data = body.get("data", {}) if isinstance(body.get("data"), dict) else body
+    auths = data.get("authenticators", [])
+    if not isinstance(auths, list):
+        return ""
+    for a in auths:
+        if isinstance(a, dict) and a.get("type", "").lower() == "totp":
+            return str(a.get("id", ""))
+    return ""
+
+
+def _mfa_submission_paths(login_path: str) -> list:
+    """Derive candidate MFA submission endpoint paths from the login path."""
+    login_path = login_path.rstrip("/")
+    # Parent directory (strip last segment, e.g. /api/auth/login → /api/auth)
+    parent = "/".join(login_path.split("/")[:-1]) or "/"
+    seen: set = set()
+    paths: list = []
+
+    def _add(p: str) -> None:
+        p = p.rstrip("/") or "/"
+        if p not in seen:
+            seen.add(p)
+            paths.append(p)
+
+    # Parent + common MFA suffixes (highest priority)
+    for sfx in _MFA_SUBMISSION_SUFFIXES:
+        _add(parent + sfx)
+    # Login path itself + common MFA suffixes
+    for sfx in _MFA_SUBMISSION_SUFFIXES:
+        _add(login_path + sfx)
+    return paths
+
+
+def complete_totp(
+    sess,
+    origin: str,
+    login_path: str,
+    mfa_cookie_name: str,
+    mfa_cookie_value: str,
+    totp_code: str,
+    authenticator_id: str,
+    timeout: int,
+) -> dict:
+    """Attempt to complete a TOTP MFA challenge.
+
+    Probes candidate MFA endpoints derived from *login_path*, submitting
+    *totp_code* in various field names. The *mfa_cookie* is set on the session
+    before each attempt so the server can correlate the MFA step with the
+    credential step.
+
+    Returns a result dict with at minimum: method, success, status, evidence.
+    """
+    result: dict = {
+        "method":   "totp_mfa",
+        "success":  False,
+        "status":   None,
+        "evidence": "",
+    }
+
+    if not totp_code:
+        result["evidence"] = "No TOTP code generated (check --totp-secret format)"
+        return result
+
+    candidate_paths = _mfa_submission_paths(login_path)
+
+    for path in candidate_paths:
+        url = origin.rstrip("/") + path
+
+        # Attach MFA session cookie before each attempt
+        if mfa_cookie_name and mfa_cookie_value:
+            sess.cookies.set(mfa_cookie_name, mfa_cookie_value,
+                             domain=urlparse(origin).hostname or "")
+
+        for field in _MFA_CODE_FIELDS:
+            payload: dict = {field: totp_code}
+            if authenticator_id:
+                payload["authenticator_id"] = authenticator_id
+
+            r = _safe_post(sess, url, timeout,
+                           json=payload,
+                           headers={"Content-Type": "application/json",
+                                    "Accept": "application/json"})
+            if r is None:
+                continue
+
+            result["status"] = r.status_code
+            body      = _json_body(r)
+            body_text = r.text or ""
+
+            # ── Success: token key in body ──────────────────────
+            if r.status_code in (200, 201) and isinstance(body, dict):
+                all_keys = _nested_keys(body)
+                matched  = all_keys & {k.lower() for k in _TOKEN_RESPONSE_KEYS}
+                if matched:
+                    result.update({
+                        "success":    True,
+                        "token_keys": list(matched),
+                        "endpoint":   url,
+                        "field":      field,
+                        "evidence":   (
+                            f"TOTP accepted — token key(s) found: {matched} "
+                            f"(endpoint: {url}, field: '{field}')"
+                        ),
+                    })
+                    return result
+
+                # 200 with no token key — check for new session cookies
+                if r.status_code == 200 and not any(
+                    pat.search(body_text) for pat in
+                    _JSON_AUTH_ERROR_PATTERNS + _JSON_CRED_FAILURE_PATTERNS
+                ):
+                    new_cookies = [
+                        c.name for c in sess.cookies
+                        if _SESSION_COOKIE_NAMES.search(c.name)
+                    ]
+                    if new_cookies:
+                        result.update({
+                            "success":  True,
+                            "endpoint": url,
+                            "field":    field,
+                            "evidence": (
+                                f"TOTP accepted — session cookie(s) set: "
+                                f"{new_cookies} (endpoint: {url}, field: '{field}')"
+                            ),
+                        })
+                        return result
+
+            # ── Endpoint found but code rejected ─────────────────
+            if r.status_code in (400, 401, 403, 422):
+                if re.search(
+                    r'(invalid|wrong|incorrect|expired|bad).*(?:code|token|otp|totp|pin)',
+                    body_text, re.I
+                ):
+                    result.update({
+                        "success":             False,
+                        "totp_endpoint_found": True,
+                        "endpoint":            url,
+                        "field":               field,
+                        "evidence": (
+                            f"TOTP endpoint found but code rejected — HTTP {r.status_code} "
+                            f"(endpoint: {url}, field: '{field}'). "
+                            "The code may have expired; re-run with a fresh --totp-secret."
+                        ),
+                    })
+                    return result
+
+    result["evidence"] = (
+        f"No MFA submission endpoint responded to TOTP code "
+        f"(tried {len(candidate_paths)} path(s)). "
+        "Endpoint path may be non-standard — try --url with the MFA path directly."
+    )
+    return result
 
 
 # ─────────────────────────────────────────────────────────────
@@ -507,10 +728,15 @@ def validate_token_login(sess, login_url: str, username: str, password: str,
         # MFA challenge — credentials were valid; server wants a second factor
         if _is_mfa_challenge(r, body_text):
             mfa_types = _extract_mfa_types(body) if isinstance(body, dict) else []
+            cookie_name, cookie_value = _extract_mfa_cookie(body, r)
+            totp_id = _extract_default_totp_id(body)
             best.update({
-                "success":       True,
-                "mfa_required":  True,
-                "mfa_types":     mfa_types,
+                "success":              True,
+                "mfa_required":         True,
+                "mfa_types":            mfa_types,
+                "mfa_cookie_name":      cookie_name,
+                "mfa_cookie_value":     cookie_value,
+                "totp_authenticator_id": totp_id,
                 "evidence":      (
                     f"Credentials accepted — MFA challenge issued "
                     f"(HTTP {r.status_code}, field combo: {ufield}/{pfield})"
@@ -621,7 +847,12 @@ def _print_findings(findings: dict, args):
 
     if findings.get("token_login_likely"):
         url = findings.get("token_login_url", "")
-        detected.append(("Token / JWT Login API", f"endpoint: {url}"))
+        if findings.get("mfa_required"):
+            mfa_types = ", ".join(findings.get("mfa_types", [])) or "unknown"
+            detected.append(("Token / JWT Login API + MFA",
+                              f"endpoint: {url} — MFA types: {mfa_types}"))
+        else:
+            detected.append(("Token / JWT Login API", f"endpoint: {url}"))
 
     for entry in findings.get("oauth_discovery", []):
         detected.append(("OAuth2 / OIDC",
@@ -666,17 +897,34 @@ def _print_findings(findings: dict, args):
             meth     = r.get("method", "?")
             sc       = r.get("status", "?")
             extra    = r.get("evidence", r.get("redirected_to", ""))
-            if mfa_req:
+
+            if meth == "totp_mfa":
+                if ok:
+                    icon = green("✓ TOTP ACCEPTED")
+                elif r.get("totp_endpoint_found"):
+                    icon = yellow("~ TOTP ENDPOINT FOUND (code rejected)")
+                else:
+                    icon = red("✗ TOTP FAILED")
+                ep = r.get("endpoint", "")
+                sc_str = f"  status={sc}" if sc else ""
+                print(f"  {icon}{sc_str}")
+                if ep:
+                    print(f"       {dim('endpoint: ' + ep)}")
+            elif mfa_req:
                 mfa_types = r.get("mfa_types", [])
                 mfa_label = f"  [{', '.join(mfa_types)}]" if mfa_types else ""
                 icon = green(f"✓ VALID — MFA Required{mfa_label}")
+                print(f"  {icon}  method={bold(meth)}  status={sc}")
             elif ok:
                 icon = green("✓ VALID")
+                print(f"  {icon}  method={bold(meth)}  status={sc}")
             elif r.get("endpoint_confirmed"):
                 icon = yellow("~ CONFIRMED (wrong creds)")
+                print(f"  {icon}  method={bold(meth)}  status={sc}")
             else:
                 icon = red("✗ FAILED")
-            print(f"  {icon}  method={bold(meth)}  status={sc}")
+                print(f"  {icon}  method={bold(meth)}  status={sc}")
+
             if extra:
                 print(f"       {dim(extra)}")
 
@@ -737,8 +985,10 @@ def main():
                         help="Username for credential validation")
     parser.add_argument("--password",  metavar="PASS",  default="",
                         help="Password for credential validation")
-    parser.add_argument("--token",     metavar="TOKEN", default="",
+    parser.add_argument("--token",       metavar="TOKEN",  default="",
                         help="Bearer token for credential validation")
+    parser.add_argument("--totp-secret", metavar="SECRET", default="",
+                        help="Base32 TOTP secret — auto-completes MFA challenge after valid credentials")
     parser.add_argument("--proxy",     metavar="PROXY", default="",
                         help="HTTP proxy (e.g. http://127.0.0.1:8080)")
     parser.add_argument("--timeout",   metavar="SEC",   type=int, default=10,
@@ -859,9 +1109,52 @@ def main():
             findings["validation_results"].append(result)
             if result.get("success") or result.get("endpoint_confirmed"):
                 # Update detection findings based on validation results
-                if result.get("success"):
+                if result.get("success") and not result.get("mfa_required"):
                     findings["token_login_likely"] = True
                     findings["token_login_url"]    = lt
+                elif result.get("mfa_required"):
+                    findings["token_login_likely"] = True
+                    findings["token_login_url"]    = lt
+                    findings["mfa_required"]       = True
+                    findings["mfa_types"]          = result.get("mfa_types", [])
+                    # ── TOTP completion ──────────────────────────────
+                    totp_secret = getattr(args, "totp_secret", "").strip()
+                    if totp_secret and "totp" in [t.lower() for t in result.get("mfa_types", [])]:
+                        totp_code = _generate_totp(totp_secret)
+                        if totp_code:
+                            print(f"  {dim('[4b/4]')} Completing TOTP MFA challenge…")
+                            _, lt_path, _ = _split_url(lt)
+                            totp_result = complete_totp(
+                                sess, origin, lt_path,
+                                result.get("mfa_cookie_name", ""),
+                                result.get("mfa_cookie_value", ""),
+                                totp_code,
+                                result.get("totp_authenticator_id", ""),
+                                args.timeout,
+                            )
+                            findings["validation_results"].append(totp_result)
+                            if totp_result.get("success"):
+                                findings["token_login_likely"] = True
+                                findings["token_login_url"]    = totp_result.get("endpoint", lt)
+                        else:
+                            findings["validation_results"].append({
+                                "method":   "totp_mfa",
+                                "success":  False,
+                                "status":   None,
+                                "evidence": "pyotp not installed — run: pip install pyotp",
+                            })
+                    elif totp_secret:
+                        # Secret provided but no totp in mfa_types — warn
+                        findings["validation_results"].append({
+                            "method":   "totp_mfa",
+                            "success":  False,
+                            "status":   None,
+                            "evidence": (
+                                f"--totp-secret provided but TOTP not in MFA types "
+                                f"({result.get('mfa_types', [])}). "
+                                "Skipping TOTP completion."
+                            ),
+                        })
                 else:
                     findings["json_api_auth"]     = True
                     findings["json_api_auth_url"] = lt

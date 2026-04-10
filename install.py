@@ -9,6 +9,7 @@ REQUIREMENTS = [
     "requests>=2.28.0",
     "requests-ntlm>=1.2.0",
     "requests-kerberos>=0.14.0",
+    "pyotp>=2.8.0",
 ]
 
 BANNER = """
@@ -48,6 +49,7 @@ def main():
     print("    python3 authprobe.py --url https://target.com --type webapp")
     print("    python3 authprobe.py --url https://api.target.com --type api")
     print("    python3 authprobe.py --url https://target.com --username admin --password secret")
+    print("    python3 authprobe.py --url https://target.com --username admin --password secret --totp-secret BASE32SECRET")
     print()
 
 
