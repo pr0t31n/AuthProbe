@@ -29,18 +29,29 @@ def main():
     print(f"  Python: {sys.version.split()[0]}  ✓")
     print()
 
+    failed = []
     for pkg in REQUIREMENTS:
         print(f"  Installing {pkg}…")
         try:
             subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", pkg, "--quiet"],
+                [sys.executable, "-m", "pip", "install", pkg, "--quiet",
+                 "--break-system-packages"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
             print(f"  ✓ {pkg}")
         except subprocess.CalledProcessError:
-            pkg_name = pkg.split(">=")[0]
-            print(f"  ! {pkg_name} — optional, some features may be unavailable")
+            print(f"  ✗ {pkg} — FAILED")
+            failed.append(pkg)
+
+    if failed:
+        print()
+        print(f"  ERROR: {len(failed)} package(s) failed to install:")
+        for pkg in failed:
+            print(f"    - {pkg}")
+        print()
+        print("  Fix the errors above and re-run install.py.")
+        sys.exit(1)
 
     print()
     print("  Installation complete.")
