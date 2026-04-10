@@ -7,46 +7,45 @@ in use and optionally validates credentials for each method.
 
 Usage:
     python3 authprobe.py --url https://target.com [options]
-    python3 authprobe.py --url https://api.target.com --type api [options]
+    python3 authprobe.py --url https://api.target.com/auth/login --username u --password p
 """
 
 import argparse
 import json
 import re
 import sys
-import time
 import warnings
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # Suppress SSL warnings for testing
 warnings.filterwarnings("ignore")
 
 BANNER = r"""
-╔══════════════════════��═══════════════════════════���════════╗
-║                                                           ║
-║    █████╗ ██╗   ██╗████████╗██╗  ██╗                     ║
-║   ██╔══██╗██║   ██║╚══██╔══╝██║  ██║                     ║
-║   ███████║██║   ██║   ██║   ███████║                     ║
-║   ██╔══██║██║   ██║   ██║   ██╔══██║                     ║
-║   ██║  ██║╚██████╔╝   ██║   ██║  ██║                     ║
-║   ╚═╝  ╚═╝ ╚═════╝    ╚═╝   ╚═╝  ╚═╝                     ║
-║                                                           ║
-║   ██████╗ ██████╗  ██████╗ ██████╗ ███████╗              ║
-║   ██╔══██╗██╔══██╗██╔═══██╗██╔══██╗██╔════╝              ║
-║   ██████╔╝██████╔╝██║   ██║██████╔╝█████╗                ║
-║   ██╔═══╝ ██╔══██╗██║   ██║██╔══██╗██╔══╝                ║
-║   ██║     ██║  ██║╚██████╔╝██████╔╝███████╗              ║
-║   ╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝              ║
-║                                                           ║
-║   Authentication Detection & Probing Tool  v{ver:<8}    ║
-║   For authorized security testing only                    ║
-╚═════════════════════════════════════════════════��═════════╝
+ ┌─────────────────────────────────────────────────────────┐
+ │                                                         │
+ │   █████╗ ██╗   ██╗████████╗██╗  ██╗                    │
+ │  ██╔══██╗██║   ██║╚══██╔══╝██║  ██║                    │
+ │  ███████║██║   ██║   ██║   ███████║                    │
+ │  ██╔══██║██║   ██║   ██║   ██╔══██║                    │
+ │  ██║  ██║╚██████╔╝   ██║   ██║  ██║                    │
+ │  ╚═╝  ╚═╝ ╚═════╝    ╚═╝   ╚═╝  ╚═╝                    │
+ │                                                         │
+ │  ██████╗ ██████╗  ██████╗ ██████╗ ███████╗             │
+ │  ██╔══██╗██╔══██╗██╔═══██╗██╔══██╗██╔════╝             │
+ │  ██████╔╝██████╔╝██║   ██║██████╔╝█████╗               │
+ │  ██╔═══╝ ██╔══██╗██║   ██║██╔══██╗██╔══╝               │
+ │  ██║     ██║  ██║╚██████╔╝██████╔╝███████╗             │
+ │  ╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝             │
+ │                                                         │
+ │  Authentication Detection & Probing Tool  v{ver:<7}    │
+ │  For authorized security testing only                   │
+ └─────────────────────────────────────────────────────────┘
 """.format(ver=VERSION)
 
-# ──────────────────────���───────────────────────────────��──────
-# Colour helpers (fallback to plain if no ANSI support)
+# ─────────────────────────────────────────────────────────────
+# Colour helpers
 # ─────────────────────────────────────────────────────────────
 def _c(code, text):
     if sys.stdout.isatty():
@@ -61,11 +60,10 @@ def bold(t):   return _c("1",  t)
 def dim(t):    return _c("2",  t)
 
 
-# ───────────────────────���────────────────────────────��────────
+# ─────────────────────────────────────────────────────────────
 # Detection signatures
 # ─────────────────────────────────────────────────────────────
 
-# WWW-Authenticate header → method
 _WWW_AUTH_MAP = {
     "basic":     "HTTP Basic",
     "digest":    "HTTP Digest",
@@ -75,7 +73,6 @@ _WWW_AUTH_MAP = {
     "oauth":     "OAuth",
 }
 
-# Response body patterns that hint at form login
 _FORM_LOGIN_PATTERNS = [
     re.compile(r'<input[^>]+type=["\']password["\']', re.I),
     re.compile(r'<form[^>]+action=["\'][^"\']*log[^"\']*["\']', re.I),
@@ -86,45 +83,79 @@ _FORM_LOGIN_PATTERNS = [
     re.compile(r'name=["\']password["\']', re.I),
 ]
 
-# JSON response keys that indicate a token-based login API
-_TOKEN_LOGIN_JSON_KEYS = {
+# JSON response keys that indicate a successful token response
+_TOKEN_RESPONSE_KEYS = {
     "access_token", "token", "jwt", "id_token", "auth_token",
-    "bearer", "sessionToken",
+    "bearer", "sessionToken", "accessToken", "idToken", "authToken",
 }
 
-# Cookie names that indicate session-based auth
+# JSON body patterns indicating an auth-protected endpoint (error responses)
+_JSON_AUTH_ERROR_PATTERNS = [
+    re.compile(r'"(message|error|msg)"\s*:\s*"[^"]*(?:unauthorized|unauthenticated|'
+               r'not authenticated|authentication required|invalid.*(?:cred|pass|token)|'
+               r'login required|access denied)[^"]*"', re.I),
+    re.compile(r'"code"\s*:\s*"[^"]*(?:auth|unauthorized|unauthenticated|'
+               r'invalid_credentials|login_required)[^"]*"', re.I),
+    re.compile(r'"status"\s*:\s*"(?:unauthorized|unauthenticated)"', re.I),
+    re.compile(r'"(code|status)"\s*:\s*40[13]', re.I),
+]
+
+# JSON body patterns indicating credentials were checked (wrong creds, not missing)
+_JSON_CRED_FAILURE_PATTERNS = [
+    re.compile(r'"(message|error|msg)"\s*:\s*"[^"]*(?:invalid.*(?:username|password|cred)|'
+               r'wrong.*(?:username|password)|incorrect.*(?:username|password)|'
+               r'authentication failed|login failed)[^"]*"', re.I),
+    re.compile(r'"code"\s*:\s*"[^"]*(?:invalid_cred|wrong_cred|auth.*fail|'
+               r'authentication_failed)[^"]*"', re.I),
+]
+
+# URL path patterns that indicate a login/auth endpoint
+_LOGIN_PATH_RE = re.compile(
+    r'/(auth/login|auth/token|auth/signin|api/auth|api/login|api/signin|'
+    r'api/token|oauth/token|connect/token|login|signin|sign-in|'
+    r'v\d+/auth|v\d+/login|user[s]?/login|account/login|session[s]?)',
+    re.I,
+)
+
 _SESSION_COOKIE_NAMES = re.compile(
-    r"(session|sess|auth|jwt|token|PHPSESSID|JSESSIONID|ASP\.NET_SessionId|"
-    r"connect\.sid|sid|sso|remember_me)",
+    r'(session|sess|auth|jwt|token|PHPSESSID|JSESSIONID|ASP\.NET_SessionId|'
+    r'connect\.sid|sid|sso|remember_me)',
     re.I,
 )
 
-# Header names that indicate API key auth
 _API_KEY_HEADERS = re.compile(
-    r"(X-API-Key|X-Auth-Token|X-Access-Token|Authorization|"
-    r"X-App-Key|X-App-Token|API-Key|X-RapidAPI-Key)",
+    r'(X-API-Key|X-Auth-Token|X-Access-Token|X-App-Key|X-App-Token|'
+    r'API-Key|X-RapidAPI-Key)',
     re.I,
 )
 
-# Common login / auth endpoint paths
-_LOGIN_PATHS = [
+_OAUTH_DISCOVERY_PATHS = [
+    "/.well-known/openid-configuration",
+    "/.well-known/oauth-authorization-server",
+]
+
+_LOGIN_PROBE_PATHS = [
     "/login", "/signin", "/sign-in", "/auth", "/auth/login",
     "/api/login", "/api/auth", "/api/auth/login", "/api/signin",
     "/api/token", "/oauth/token", "/connect/token",
     "/v1/auth", "/v1/login", "/v2/auth", "/v2/login",
     "/user/login", "/users/login", "/account/login",
     "/api/v1/auth", "/api/v1/login", "/api/v2/auth", "/api/v2/login",
+    "/api/v1/auth/login", "/api/v2/auth/login",
 ]
 
-# Well-known OAuth/OIDC metadata paths
-_OAUTH_DISCOVERY_PATHS = [
-    "/.well-known/openid-configuration",
-    "/.well-known/oauth-authorization-server",
+# Common field name combos for form/JSON login probing
+_CRED_FIELD_COMBOS = [
+    ("username", "password"),
+    ("email",    "password"),
+    ("user",     "pass"),
+    ("login",    "password"),
+    ("name",     "password"),
 ]
 
 
 # ─────────────────────────────────────────────────────────────
-# Session factory
+# HTTP helpers
 # ─────────────────────────────────────────────────────────────
 
 def _make_session(args):
@@ -138,19 +169,15 @@ def _make_session(args):
     sess.verify = False
     sess.headers.update({
         "User-Agent": f"AuthProbe/{VERSION} (Security Assessment)",
-        "Accept": "text/html,application/json,*/*",
+        "Accept": "application/json, text/html, */*",
     })
     if args.proxy:
         sess.proxies = {"http": args.proxy, "https": args.proxy}
-    adapter = HTTPAdapter(max_retries=1)
-    sess.mount("http://", adapter)
-    sess.mount("https://", adapter)
+    from requests.adapters import HTTPAdapter
+    sess.mount("http://",  HTTPAdapter(max_retries=1))
+    sess.mount("https://", HTTPAdapter(max_retries=1))
     return sess
 
-
-# ─────────────────────────────────────────────────────────────
-# Probe helpers
-# ─────────────────────────────────────────────────────────────
 
 def _safe_get(sess, url, timeout, **kwargs):
     try:
@@ -166,15 +193,50 @@ def _safe_post(sess, url, timeout, **kwargs):
         return None
 
 
-def _parse_www_auth(header_value: str) -> list[str]:
-    """Extract scheme names from a WWW-Authenticate header."""
-    schemes = []
-    for part in header_value.split(","):
-        part = part.strip()
-        scheme = part.split()[0].lower() if part else ""
-        if scheme:
-            schemes.append(scheme)
-    return schemes
+def _is_json_response(resp) -> bool:
+    if resp is None:
+        return False
+    ct = resp.headers.get("Content-Type", "").lower()
+    return "json" in ct
+
+
+def _json_body(resp) -> dict | None:
+    if resp is None:
+        return None
+    try:
+        return resp.json()
+    except Exception:
+        return None
+
+
+def _nested_keys(d: dict) -> set:
+    """Recursively collect all string keys and string values from a dict."""
+    result = set()
+    if not isinstance(d, dict):
+        return result
+    for k, v in d.items():
+        result.add(str(k).lower())
+        if isinstance(v, str):
+            result.add(v.lower())
+        elif isinstance(v, dict):
+            result |= _nested_keys(v)
+    return result
+
+
+# ─────────────────────────────────────────────────────────────
+# URL analysis
+# ─────────────────────────────────────────────────────────────
+
+def _split_url(url: str) -> tuple[str, str, str]:
+    """Return (origin, path, full_url). Origin = scheme://host[:port]."""
+    p = urlparse(url)
+    port_part = f":{p.port}" if p.port and p.port not in (80, 443) else ""
+    origin = f"{p.scheme}://{p.hostname}{port_part}"
+    return origin, p.path, url
+
+
+def _is_login_path(path: str) -> bool:
+    return bool(_LOGIN_PATH_RE.search(path))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -182,7 +244,6 @@ def _parse_www_auth(header_value: str) -> list[str]:
 # ─────────────────────────────────────────────────────────────
 
 def detect_www_authenticate(resp, findings: dict):
-    """Check WWW-Authenticate header on 401 responses."""
     if resp is None:
         return
     if resp.status_code not in (401, 403):
@@ -190,17 +251,34 @@ def detect_www_authenticate(resp, findings: dict):
     www_auth = resp.headers.get("WWW-Authenticate", "")
     if not www_auth:
         return
-    for scheme in _parse_www_auth(www_auth):
-        label = _WWW_AUTH_MAP.get(scheme, f"Unknown ({scheme})")
-        findings["www_authenticate"].append({
-            "scheme": scheme,
-            "label":  label,
-            "header": www_auth,
-        })
+    for part in www_auth.split(","):
+        part = part.strip()
+        scheme = part.split()[0].lower() if part else ""
+        if scheme:
+            label = _WWW_AUTH_MAP.get(scheme, f"Unknown ({scheme})")
+            findings["www_authenticate"].append({"scheme": scheme, "label": label, "header": www_auth})
+
+
+def detect_basic_auth(resp, findings: dict):
+    if resp is None:
+        return
+    www_auth = resp.headers.get("WWW-Authenticate", "").lower()
+    if www_auth.startswith("basic"):
+        m = re.search(r'realm=["\']([^"\']+)["\']', www_auth, re.I)
+        findings["basic_auth"] = {"realm": m.group(1) if m else ""}
+
+
+def detect_ntlm_kerberos(resp, findings: dict):
+    if resp is None:
+        return
+    www_auth = resp.headers.get("WWW-Authenticate", "").lower()
+    if "ntlm" in www_auth:
+        findings["ntlm_detected"] = True
+    if "negotiate" in www_auth:
+        findings["kerberos_detected"] = True
 
 
 def detect_form_login(resp, findings: dict):
-    """Look for HTML login form patterns in the response body."""
     if resp is None or resp.status_code not in (200, 301, 302):
         return
     ct = resp.headers.get("Content-Type", "")
@@ -213,29 +291,65 @@ def detect_form_login(resp, findings: dict):
         findings["form_login_evidence"] = matches[:3]
 
 
-def detect_api_token_login(resp, url: str, findings: dict):
-    """
-    Probe common API auth endpoints and look for token responses.
-    Only used when --type api is set.
+def detect_json_api_auth(resp, url: str, findings: dict):
+    """Detect JSON API authentication by inspecting the response body and status.
+
+    Handles the common REST API pattern where the server returns a JSON error
+    body without a WWW-Authenticate header — e.g.:
+      {"error":{"code":401,"message":"Unauthorized"}}
+      {"message":"Invalid username or password","code":"AUTHENTICATION_FAILED_..."}
     """
     if resp is None:
         return
-    ct = resp.headers.get("Content-Type", "")
-    if "json" not in ct.lower():
+    if not _is_json_response(resp) and resp.status_code not in (400, 401, 403, 422):
         return
-    try:
-        data = resp.json()
-    except Exception:
+
+    body_text = resp.text or ""
+    body_json  = _json_body(resp)
+
+    # 1. HTTP 401/403 with JSON body → definitely auth-protected
+    if resp.status_code in (401, 403) and (body_json or body_text.strip().startswith("{")):
+        findings["json_api_auth"] = True
+        findings["json_api_auth_url"] = url
+        # Check if this specific response indicates a credential check
+        # (i.e. creds were actually evaluated, not just missing)
+        for pat in _JSON_CRED_FAILURE_PATTERNS:
+            if pat.search(body_text):
+                findings["json_api_cred_checked"] = True
+                break
         return
-    if isinstance(data, dict):
-        keys = {k.lower() for k in data.keys()}
-        if keys & {k.lower() for k in _TOKEN_LOGIN_JSON_KEYS}:
-            findings["token_login_likely"] = True
-            findings["token_login_url"] = url
+
+    # 2. HTTP 200/400/422 — scan body for auth error patterns
+    for pat in _JSON_AUTH_ERROR_PATTERNS:
+        if pat.search(body_text):
+            findings["json_api_auth"] = True
+            findings["json_api_auth_url"] = url
+            break
+
+    # 3. Check for credential-failure-specific patterns
+    if not findings.get("json_api_cred_checked"):
+        for pat in _JSON_CRED_FAILURE_PATTERNS:
+            if pat.search(body_text):
+                findings["json_api_auth"] = True
+                findings["json_api_auth_url"] = url
+                findings["json_api_cred_checked"] = True
+                break
+
+
+def detect_token_login_response(resp, url: str, findings: dict):
+    """Check if the response contains a JSON token (successful login response)."""
+    if not _is_json_response(resp):
+        return
+    body = _json_body(resp)
+    if not isinstance(body, dict):
+        return
+    all_keys = _nested_keys(body)
+    if all_keys & {k.lower() for k in _TOKEN_RESPONSE_KEYS}:
+        findings["token_login_likely"] = True
+        findings["token_login_url"] = url
 
 
 def detect_session_cookies(resp, findings: dict):
-    """Look for session/auth cookie names."""
     if resp is None:
         return
     for cookie in resp.cookies:
@@ -243,10 +357,26 @@ def detect_session_cookies(resp, findings: dict):
             findings["session_cookies"].append(cookie.name)
 
 
-def detect_oauth_discovery(sess, base_url: str, timeout: int, findings: dict):
-    """Probe /.well-known/ paths for OAuth/OIDC discovery."""
+def detect_security_headers(resp, findings: dict):
+    if resp is None:
+        return
+    headers = {k.lower(): v for k, v in resp.headers.items()}
+    sec = {}
+    for h in ("x-frame-options", "content-security-policy",
+               "strict-transport-security", "x-content-type-options"):
+        if h in headers:
+            val = headers[h]
+            sec[h.title()] = val[:80] + "…" if len(val) > 80 else val
+    if sec:
+        findings["security_headers"] = sec
+    for h in resp.headers:
+        if _API_KEY_HEADERS.search(h):
+            findings["api_key_header_hints"].append(h)
+
+
+def detect_oauth_discovery(sess, origin: str, timeout: int, findings: dict):
     for path in _OAUTH_DISCOVERY_PATHS:
-        url = base_url.rstrip("/") + path
+        url = origin.rstrip("/") + path
         r = _safe_get(sess, url, timeout)
         if r and r.status_code == 200:
             try:
@@ -262,75 +392,32 @@ def detect_oauth_discovery(sess, base_url: str, timeout: int, findings: dict):
                 pass
 
 
-def detect_login_endpoints(sess, base_url: str, timeout: int, probe_type: str, findings: dict):
-    """Probe common login endpoint paths."""
+def detect_login_endpoints(sess, origin: str, timeout: int, probe_type: str,
+                           skip_paths: set, findings: dict):
+    """Probe common login paths from the API origin root."""
     found = []
-    for path in _LOGIN_PATHS:
+    for path in _LOGIN_PROBE_PATHS:
+        if path.rstrip("/") in skip_paths:
+            continue
         if probe_type == "webapp" and path.startswith("/api/"):
             continue
-        if probe_type == "api" and not path.startswith("/api") and "token" not in path:
-            continue
-        url = base_url.rstrip("/") + path
+        url = origin.rstrip("/") + path
         r = _safe_get(sess, url, timeout)
-        if r and r.status_code in (200, 301, 302, 401, 403):
+        if r and r.status_code in (200, 301, 302, 400, 401, 403, 422):
             found.append({
                 "path": path,
                 "status": r.status_code,
                 "content_type": r.headers.get("Content-Type", "")[:60],
             })
-            # Check for JSON token endpoint
-            detect_api_token_login(r, url, findings)
-            # Check for form login
+            detect_json_api_auth(r, url, findings)
+            detect_token_login_response(r, url, findings)
             if probe_type == "webapp":
                 detect_form_login(r, findings)
     if found:
-        findings["login_endpoints"] = found
-
-
-def detect_security_headers(resp, findings: dict):
-    """Check for auth-related security headers."""
-    if resp is None:
-        return
-    headers = {k.lower(): v for k, v in resp.headers.items()}
-    security = {}
-    if "x-frame-options" in headers:
-        security["X-Frame-Options"] = headers["x-frame-options"]
-    if "content-security-policy" in headers:
-        security["Content-Security-Policy"] = headers["content-security-policy"][:80] + "…"
-    if "strict-transport-security" in headers:
-        security["Strict-Transport-Security"] = headers["strict-transport-security"]
-    if "x-content-type-options" in headers:
-        security["X-Content-Type-Options"] = headers["x-content-type-options"]
-    if security:
-        findings["security_headers"] = security
-
-    # Check for API key header hints in response headers
-    for h in resp.headers:
-        if _API_KEY_HEADERS.search(h):
-            findings["api_key_header_hints"].append(h)
-
-
-def detect_ntlm_kerberos(resp, findings: dict):
-    """Detect NTLM / Kerberos from WWW-Authenticate."""
-    if resp is None:
-        return
-    www_auth = resp.headers.get("WWW-Authenticate", "").lower()
-    if "ntlm" in www_auth:
-        findings["ntlm_detected"] = True
-    if "negotiate" in www_auth:
-        findings["kerberos_detected"] = True
-
-
-def detect_basic_auth(resp, findings: dict):
-    if resp is None:
-        return
-    www_auth = resp.headers.get("WWW-Authenticate", "").lower()
-    if www_auth.startswith("basic"):
-        realm = ""
-        m = re.search(r'realm=["\']([^"\']+)["\']', www_auth, re.I)
-        if m:
-            realm = m.group(1)
-        findings["basic_auth"] = {"realm": realm}
+        existing = {ep["path"] for ep in findings.get("login_endpoints", [])}
+        for ep in found:
+            if ep["path"] not in existing:
+                findings["login_endpoints"].append(ep)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -339,9 +426,9 @@ def detect_basic_auth(resp, findings: dict):
 
 def validate_basic(sess, url: str, username: str, password: str, timeout: int) -> dict:
     r = _safe_get(sess, url, timeout, auth=(username, password))
-    if r and r.status_code not in (401, 403):
-        return {"method": "basic", "success": True, "status": r.status_code}
-    return {"method": "basic", "success": False, "status": r.status_code if r else None}
+    ok = r is not None and r.status_code not in (401, 403)
+    return {"method": "basic", "success": ok,
+            "status": r.status_code if r else None}
 
 
 def validate_bearer(sess, url: str, token: str, timeout: int) -> dict:
@@ -350,22 +437,86 @@ def validate_bearer(sess, url: str, token: str, timeout: int) -> dict:
     s2.headers = dict(sess.headers)
     s2.headers["Authorization"] = f"Bearer {token}"
     r = _safe_get(s2, url, timeout)
-    if r and r.status_code not in (401, 403):
-        return {"method": "bearer", "success": True, "status": r.status_code}
-    return {"method": "bearer", "success": False, "status": r.status_code if r else None}
+    ok = r is not None and r.status_code not in (401, 403)
+    return {"method": "bearer", "success": ok,
+            "status": r.status_code if r else None}
 
 
-def validate_form_login(sess, login_url: str, username: str, password: str, timeout: int) -> dict:
-    # Try common field name combinations
-    for ufield, pfield in [("username", "password"), ("email", "password"), ("user", "pass"), ("login", "password")]:
-        r = _safe_post(sess, login_url, timeout, data={ufield: username, pfield: password})
-        if r and r.status_code not in (401, 403) and r.url != login_url:
-            return {"method": "form_login", "success": True, "status": r.status_code, "redirected_to": r.url}
-        if r and r.status_code == 200:
+def validate_token_login(sess, login_url: str, username: str, password: str,
+                         timeout: int) -> dict:
+    """POST JSON credentials to a login endpoint; check for token in response."""
+    best: dict = {"method": "token_login", "success": False,
+                  "status": None, "evidence": ""}
+
+    for ufield, pfield in _CRED_FIELD_COMBOS:
+        payload = {ufield: username, pfield: password}
+        r = _safe_post(sess, login_url, timeout,
+                       json=payload,
+                       headers={"Content-Type": "application/json",
+                                "Accept": "application/json"})
+        if r is None:
+            continue
+        best["status"] = r.status_code
+        body = _json_body(r)
+
+        # Successful login — token in body
+        if r.status_code in (200, 201) and isinstance(body, dict):
+            all_keys = _nested_keys(body)
+            matched = all_keys & {k.lower() for k in _TOKEN_RESPONSE_KEYS}
+            if matched:
+                best.update({
+                    "success": True,
+                    "evidence": f"token key(s) found: {matched}",
+                    "field_combo": f"{ufield}/{pfield}",
+                    "token_keys": list(matched),
+                })
+                return best
+
+        # Auth endpoint confirmed — wrong creds
+        if r.status_code in (400, 401, 403, 422):
+            body_text = r.text or ""
+            for pat in _JSON_CRED_FAILURE_PATTERNS:
+                if pat.search(body_text):
+                    best.update({
+                        "success": False,
+                        "evidence": (f"Login endpoint confirmed — credentials rejected "
+                                     f"(HTTP {r.status_code}). "
+                                     f"Field combo tried: {ufield}/{pfield}"),
+                        "field_combo": f"{ufield}/{pfield}",
+                        "endpoint_confirmed": True,
+                    })
+                    return best
+            # Generic 401/403 on POST = endpoint exists, creds wrong
+            if r.status_code in (401, 403) and _is_json_response(r):
+                best.update({
+                    "success": False,
+                    "evidence": (f"Login endpoint confirmed — HTTP {r.status_code} "
+                                 f"(field combo: {ufield}/{pfield})"),
+                    "field_combo": f"{ufield}/{pfield}",
+                    "endpoint_confirmed": True,
+                })
+                return best
+
+    return best
+
+
+def validate_form_login(sess, login_url: str, username: str, password: str,
+                        timeout: int) -> dict:
+    for ufield, pfield in _CRED_FIELD_COMBOS:
+        r = _safe_post(sess, login_url, timeout,
+                       data={ufield: username, pfield: password})
+        if r is None:
+            continue
+        if r.status_code not in (401, 403) and r.url != login_url:
+            return {"method": "form_login", "success": True,
+                    "status": r.status_code, "redirected_to": r.url}
+        if r.status_code == 200:
             body = r.text.lower()
-            if "logout" in body or "dashboard" in body or "welcome" in body or "sign out" in body:
-                return {"method": "form_login", "success": True, "status": r.status_code, "evidence": "logout/welcome text found"}
-    return {"method": "form_login", "success": False, "status": r.status_code if r else None}
+            if any(k in body for k in ("logout", "dashboard", "welcome", "sign out")):
+                return {"method": "form_login", "success": True,
+                        "status": r.status_code, "evidence": "logout/welcome text found"}
+    return {"method": "form_login", "success": False,
+            "status": r.status_code if r else None}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -381,8 +532,8 @@ def _print_section(title):
 def _print_findings(findings: dict, args):
     detected = []
 
-    if findings.get("basic_auth"):
-        realm = findings["basic_auth"].get("realm", "")
+    if findings.get("basic_auth") is not None:
+        realm = (findings["basic_auth"] or {}).get("realm", "")
         detected.append(("HTTP Basic Auth", f"realm={realm}" if realm else ""))
 
     if findings.get("ntlm_detected"):
@@ -398,14 +549,24 @@ def _print_findings(findings: dict, args):
 
     if findings.get("form_login"):
         evidence = findings.get("form_login_evidence", [])
-        detected.append(("Form-based Login", f"{len(evidence)} HTML form pattern(s) matched"))
+        detected.append(("Form-based Login",
+                          f"{len(evidence)} HTML form pattern(s) matched"))
+
+    if findings.get("json_api_auth"):
+        url = findings.get("json_api_auth_url", "")
+        cred_note = " — credentials evaluated (endpoint confirmed)" \
+                    if findings.get("json_api_cred_checked") else ""
+        detected.append(("JSON API Token Login",
+                          f"endpoint: {url}{cred_note}"))
 
     if findings.get("token_login_likely"):
         url = findings.get("token_login_url", "")
         detected.append(("Token / JWT Login API", f"endpoint: {url}"))
 
     for entry in findings.get("oauth_discovery", []):
-        detected.append(("OAuth2 / OIDC", f"issuer: {entry.get('issuer','?')} | token_ep: {entry.get('token_endpoint','?')}"))
+        detected.append(("OAuth2 / OIDC",
+                          f"issuer: {entry.get('issuer','?')} | "
+                          f"token_ep: {entry.get('token_endpoint','?')}"))
 
     if findings.get("session_cookies"):
         names = ", ".join(findings["session_cookies"][:5])
@@ -428,8 +589,9 @@ def _print_findings(findings: dict, args):
     if findings.get("login_endpoints"):
         _print_section("LOGIN ENDPOINTS FOUND")
         for ep in findings["login_endpoints"]:
-            status_colour = green if ep["status"] in (200, 302) else yellow
-            print(f"  {status_colour(str(ep['status']))}  {ep['path']}  {dim(ep['content_type'])}")
+            sc = ep["status"]
+            colour = green if sc in (200, 302) else yellow
+            print(f"  {colour(str(sc))}  {ep['path']}  {dim(ep['content_type'])}")
 
     if findings.get("security_headers"):
         _print_section("SECURITY HEADERS")
@@ -439,12 +601,16 @@ def _print_findings(findings: dict, args):
     if findings.get("validation_results"):
         _print_section("CREDENTIAL VALIDATION")
         for r in findings["validation_results"]:
-            ok = r.get("success", False)
-            m  = r.get("method", "?")
-            sc = r.get("status", "?")
-            extra = r.get("redirected_to", r.get("evidence", ""))
-            icon = green("✓ VALID") if ok else red("✗ FAILED")
-            print(f"  {icon}  method={bold(m)}  status={sc}  {dim(extra)}")
+            ok    = r.get("success", False)
+            meth  = r.get("method", "?")
+            sc    = r.get("status", "?")
+            extra = r.get("evidence", r.get("redirected_to", ""))
+            icon  = green("✓ VALID") if ok else (
+                    yellow("~ CONFIRMED (wrong creds)") if r.get("endpoint_confirmed") else
+                    red("✗ FAILED"))
+            print(f"  {icon}  method={bold(meth)}  status={sc}")
+            if extra:
+                print(f"       {dim(extra)}")
 
     _print_section("RECOMMENDED AUTH METHOD FOR FRACTURE / SIPHON")
     if findings.get("ntlm_detected"):
@@ -454,10 +620,14 @@ def _print_findings(findings: dict, args):
     elif findings.get("oauth_discovery"):
         print(f"  → {bold('oauth2_client_creds')}  (or bearer with pre-obtained token)")
     elif findings.get("token_login_likely"):
-        print(f"  → {bold('token_login')}  (POST creds to {findings.get('token_login_url','')})")
+        url = findings.get("token_login_url", "")
+        print(f"  → {bold('token_login')}  (POST credentials to {url})")
+    elif findings.get("json_api_auth"):
+        url = findings.get("json_api_auth_url", "")
+        print(f"  → {bold('token_login')}  (POST credentials to {url})")
     elif findings.get("form_login"):
-        print(f"  → {bold('form_login')}  (POST creds to login form)")
-    elif findings.get("basic_auth"):
+        print(f"  → {bold('form_login')}  (POST credentials to login form)")
+    elif findings.get("basic_auth") is not None:
         print(f"  → {bold('basic')}  (HTTP Basic Auth)")
     elif findings.get("session_cookies"):
         print(f"  → {bold('session_cookie')}  (inject pre-captured cookie)")
@@ -465,6 +635,18 @@ def _print_findings(findings: dict, args):
         print(f"  → {bold('apikey_header')}  (set key in request header)")
     else:
         print(f"  → {yellow('unknown')}  (manual inspection recommended)")
+
+    # Siphon/Fracture config snippet
+    if findings.get("json_api_auth") or findings.get("token_login_likely"):
+        url = findings.get("token_login_url") or findings.get("json_api_auth_url", "")
+        vr  = findings.get("validation_results", [])
+        tl  = next((r for r in vr if r.get("method") == "token_login"), None)
+        combo_hint = f"  # field combo: {tl['field_combo']}" if tl and tl.get("field_combo") else ""
+        print(f"\n  {dim('Siphon config snippet:')}")
+        print(f'  {dim("scan.auth.method")}           = {cyan("token_login")}')
+        print(f'  {dim("scan.auth.login_url")}        = {cyan(url)}')
+        if combo_hint:
+            print(f'  {dim(combo_hint)}')
 
 
 # ─────────────────────────────────────────────────────────────
@@ -478,95 +660,164 @@ def main():
         prog="authprobe.py",
         description="AuthProbe — Detect & probe authentication methods on web apps and APIs",
     )
-    parser.add_argument("--url",        metavar="URL",    required=True,  help="Target URL to probe")
-    parser.add_argument("--type",       metavar="TYPE",   default="auto",
+    parser.add_argument("--url",       metavar="URL",   required=True,
+                        help="Target URL (can be root, a login endpoint, or a protected path)")
+    parser.add_argument("--type",      metavar="TYPE",  default="auto",
                         choices=["auto", "webapp", "api"],
                         help="Target type: auto (default), webapp, or api")
-    parser.add_argument("--username",   metavar="USER",   default="",     help="Username for credential validation")
-    parser.add_argument("--password",   metavar="PASS",   default="",     help="Password for credential validation")
-    parser.add_argument("--token",      metavar="TOKEN",  default="",     help="Bearer token for credential validation")
-    parser.add_argument("--proxy",      metavar="PROXY",  default="",     help="HTTP proxy (e.g. http://127.0.0.1:8080)")
-    parser.add_argument("--timeout",    metavar="SEC",    type=int, default=10, help="Request timeout in seconds")
-    parser.add_argument("--deep",       action="store_true",              help="Probe more login endpoint paths")
-    parser.add_argument("--json",       action="store_true",              help="Output results as JSON")
-    parser.add_argument("--no-verify",  action="store_true",              help="Disable SSL verification (default: disabled)")
+    parser.add_argument("--username",  metavar="USER",  default="",
+                        help="Username for credential validation")
+    parser.add_argument("--password",  metavar="PASS",  default="",
+                        help="Password for credential validation")
+    parser.add_argument("--token",     metavar="TOKEN", default="",
+                        help="Bearer token for credential validation")
+    parser.add_argument("--proxy",     metavar="PROXY", default="",
+                        help="HTTP proxy (e.g. http://127.0.0.1:8080)")
+    parser.add_argument("--timeout",   metavar="SEC",   type=int, default=10,
+                        help="Request timeout in seconds")
+    parser.add_argument("--json",      action="store_true",
+                        help="Output results as JSON")
+    parser.add_argument("--no-verify", action="store_true",
+                        help="Disable SSL verification (already disabled by default)")
     args = parser.parse_args()
 
-    base_url = args.url.rstrip("/")
-    parsed   = urlparse(base_url)
+    raw_url = args.url.rstrip("/")
+    parsed  = urlparse(raw_url)
     if not parsed.scheme:
-        base_url = "https://" + base_url
-        parsed   = urlparse(base_url)
+        raw_url = "https://" + raw_url
+        parsed  = urlparse(raw_url)
 
-    sess = _make_session(args)
+    # ── Determine origin vs. login path ──────────────────────
+    origin, url_path, full_url = _split_url(raw_url)
+
+    # If the given URL path looks like a login endpoint, use it directly
+    # and derive origin for OAuth/general probing.
+    given_is_login_path = _is_login_path(url_path)
+    probe_root          = origin if given_is_login_path else full_url
+    direct_login_url    = full_url if given_is_login_path else None
+    # Paths already known (don't re-probe them from root)
+    skip_paths: set = {url_path.rstrip("/")} if given_is_login_path else set()
 
     # ── Auto-detect type ──────────────────────────────────────
     probe_type = args.type
     if probe_type == "auto":
-        # Heuristic: path contains /api/ or /v1/ or /v2/
-        path = parsed.path.lower()
-        if re.search(r'/api/|/v\d+/', path) or "api." in parsed.netloc.lower():
+        path_lc = url_path.lower()
+        if re.search(r'/api/|/v\d+/', path_lc) or "api." in parsed.netloc.lower():
             probe_type = "api"
         else:
             probe_type = "webapp"
-    print(f"  {dim('Target:')} {cyan(base_url)}")
-    print(f"  {dim('Mode  :')} {cyan(probe_type)}")
+
+    print(f"  {dim('Target :')} {cyan(full_url)}")
+    print(f"  {dim('Origin :')} {cyan(origin)}")
+    print(f"  {dim('Mode   :')} {cyan(probe_type)}")
+    if given_is_login_path:
+        print(f"  {dim('Note   :')} {yellow('Provided URL appears to be a login endpoint — probing directly')}")
     print()
 
     findings: dict = {
-        "www_authenticate":    [],
-        "form_login":          False,
-        "form_login_evidence": [],
-        "token_login_likely":  False,
-        "token_login_url":     "",
-        "oauth_discovery":     [],
-        "session_cookies":     [],
-        "api_key_header_hints": [],
-        "login_endpoints":     [],
-        "security_headers":    {},
-        "basic_auth":          None,
-        "ntlm_detected":       False,
-        "kerberos_detected":   False,
-        "validation_results":  [],
+        "www_authenticate":       [],
+        "form_login":             False,
+        "form_login_evidence":    [],
+        "json_api_auth":          False,
+        "json_api_auth_url":      "",
+        "json_api_cred_checked":  False,
+        "token_login_likely":     False,
+        "token_login_url":        "",
+        "oauth_discovery":        [],
+        "session_cookies":        [],
+        "api_key_header_hints":   [],
+        "login_endpoints":        [],
+        "security_headers":       {},
+        "basic_auth":             None,
+        "ntlm_detected":          False,
+        "kerberos_detected":      False,
+        "validation_results":     [],
     }
 
-    # ── Phase 1: probe base URL ─────────────────────���─────────
-    print(f"  {dim('[1/4]')} Probing base URL…")
-    base_resp = _safe_get(sess, base_url, args.timeout)
+    # ── Phase 1: Probe the provided URL ──────────────────────
+    print(f"  {dim('[1/4]')} Probing target URL…")
+    base_resp = _safe_get(sess := _make_session(args), full_url, args.timeout)
 
     detect_www_authenticate(base_resp, findings)
     detect_basic_auth(base_resp, findings)
     detect_ntlm_kerberos(base_resp, findings)
     detect_form_login(base_resp, findings)
+    detect_json_api_auth(base_resp, full_url, findings)
+    detect_token_login_response(base_resp, full_url, findings)
     detect_session_cookies(base_resp, findings)
     detect_security_headers(base_resp, findings)
 
-    # ── Phase 2: probe login endpoints ────────────────────────
-    print(f"  {dim('[2/4]')} Probing login endpoints…")
-    detect_login_endpoints(sess, base_url, args.timeout, probe_type, findings)
+    # If URL is a login path, record it immediately
+    if given_is_login_path:
+        findings["login_endpoints"].append({
+            "path": url_path,
+            "status": base_resp.status_code if base_resp else 0,
+            "content_type": base_resp.headers.get("Content-Type", "")[:60] if base_resp else "",
+        })
 
-    # ── Phase 3: OAuth/OIDC discovery ────────────────────────��
+    # ── Phase 2: Probe root origin for additional endpoints ──
+    print(f"  {dim('[2/4]')} Probing login endpoints from origin…")
+    # Also probe the origin root itself if we were given a sub-path
+    if given_is_login_path:
+        root_resp = _safe_get(sess, origin, args.timeout)
+        if root_resp:
+            detect_www_authenticate(root_resp, findings)
+            detect_basic_auth(root_resp, findings)
+            detect_ntlm_kerberos(root_resp, findings)
+            detect_form_login(root_resp, findings)
+            detect_session_cookies(root_resp, findings)
+    detect_login_endpoints(sess, origin, args.timeout, probe_type, skip_paths, findings)
+
+    # ── Phase 3: OAuth/OIDC discovery ────────────────────────
     print(f"  {dim('[3/4]')} Checking OAuth/OIDC discovery…")
-    detect_oauth_discovery(sess, base_url, args.timeout, findings)
+    detect_oauth_discovery(sess, origin, args.timeout, findings)
 
-    # ── Phase 4: Credential validation (optional) ─────────────
+    # ── Phase 4: Credential validation ───────────────────────
     print(f"  {dim('[4/4]')} Credential validation…")
+
     if args.username and args.password:
+        # Always try token_login against the login endpoint (direct or discovered)
+        login_targets = []
+        if direct_login_url:
+            login_targets.append(direct_login_url)
+        # Add any discovered login endpoints not already in login_targets
+        for ep in findings.get("login_endpoints", []):
+            ep_url = origin.rstrip("/") + ep["path"]
+            if ep_url not in login_targets and ep["status"] in (200, 400, 401, 403, 422):
+                login_targets.append(ep_url)
+
+        for lt in login_targets[:3]:  # cap at 3 attempts
+            result = validate_token_login(sess, lt, args.username, args.password, args.timeout)
+            findings["validation_results"].append(result)
+            if result.get("success") or result.get("endpoint_confirmed"):
+                # Update detection findings based on validation results
+                if result.get("success"):
+                    findings["token_login_likely"] = True
+                    findings["token_login_url"]    = lt
+                else:
+                    findings["json_api_auth"]     = True
+                    findings["json_api_auth_url"] = lt
+                    findings["json_api_cred_checked"] = True
+                break
+
+        # HTTP Basic fallback
         if findings.get("basic_auth") is not None:
-            result = validate_basic(sess, base_url, args.username, args.password, args.timeout)
+            result = validate_basic(sess, full_url, args.username, args.password, args.timeout)
             findings["validation_results"].append(result)
 
-        if findings.get("form_login") and findings.get("login_endpoints"):
-            for ep in findings["login_endpoints"]:
+        # Form login fallback
+        if findings.get("form_login"):
+            for ep in findings.get("login_endpoints", []):
                 if ep["status"] in (200, 302):
-                    login_url = base_url + ep["path"]
-                    result = validate_form_login(sess, login_url, args.username, args.password, args.timeout)
+                    result = validate_form_login(
+                        sess, origin.rstrip("/") + ep["path"],
+                        args.username, args.password, args.timeout)
                     findings["validation_results"].append(result)
                     break
 
     if args.token:
-        result = validate_bearer(sess, base_url, args.token, args.timeout)
-        findings["validation_results"].append(result)
+        findings["validation_results"].append(
+            validate_bearer(sess, full_url, args.token, args.timeout))
 
     # ── Output ────────────────────────────────────────────────
     if args.json:
