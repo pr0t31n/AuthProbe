@@ -17,7 +17,7 @@ import sys
 import warnings
 from urllib.parse import urlparse
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # Suppress SSL warnings for testing
 warnings.filterwarnings("ignore")
@@ -107,6 +107,25 @@ _JSON_CRED_FAILURE_PATTERNS = [
                r'authentication failed|login failed)[^"]*"', re.I),
     re.compile(r'"code"\s*:\s*"[^"]*(?:invalid_cred|wrong_cred|auth.*fail|'
                r'authentication_failed)[^"]*"', re.I),
+]
+
+# JSON body patterns indicating credentials were VALID but MFA is required
+_JSON_MFA_PATTERNS = [
+    re.compile(r'"code"\s*:\s*"[^"]*(?:mfa|2fa|otp|totp|two.?factor|'
+               r'multi.?factor)[^"]*(?:required|needed|challenge)[^"]*"', re.I),
+    re.compile(r'"code"\s*:\s*"[^"]*(?:required|needed|challenge)[^"]*(?:mfa|2fa|otp|'
+               r'totp|two.?factor|multi.?factor)[^"]*"', re.I),
+    # Exact common codes
+    re.compile(r'"code"\s*:\s*"(?:MFA_AUTH_REQUIRED|MFA_REQUIRED|2FA_REQUIRED|'
+               r'OTP_REQUIRED|TOTP_REQUIRED|MFA_NEEDED|TWO_FACTOR_REQUIRED|'
+               r'MULTIFACTOR_REQUIRED|MFA_CHALLENGE|AUTH_MFA_REQUIRED)"', re.I),
+    re.compile(r'"(message|msg)"\s*:\s*"[^"]*(?:mfa|two.?factor|multi.?factor|'
+               r'second.?factor|authenticat[a-z]*\s+(?:app|code|token))[^"]*required[^"]*"',
+               re.I),
+    re.compile(r'"required"\s*:\s*"(?:2fa|mfa|totp|otp)"', re.I),
+    re.compile(r'"authenticators"\s*:\s*\[', re.I),
+    re.compile(r'"mfaCookie"\s*:', re.I),
+    re.compile(r'"mfa_cookie"\s*:', re.I),
 ]
 
 # URL path patterns that indicate a login/auth endpoint
@@ -221,6 +240,31 @@ def _nested_keys(d: dict) -> set:
         elif isinstance(v, dict):
             result |= _nested_keys(v)
     return result
+
+
+def _extract_mfa_types(body: dict) -> list:
+    """Extract MFA authenticator types from a challenge response body."""
+    types = []
+    if not isinstance(body, dict):
+        return types
+    # data.authenticators[].type  OR  authenticators[].type (top-level)
+    for key in ("authenticators",):
+        data = body.get("data", {}) if isinstance(body.get("data"), dict) else {}
+        auths = body.get(key) or data.get(key) or []
+        if isinstance(auths, list):
+            for a in auths:
+                t = (a.get("type") or "") if isinstance(a, dict) else ""
+                if t and t not in types:
+                    types.append(t)
+    return types
+
+
+def _is_mfa_challenge(resp, body_text: str = "") -> bool:
+    """Return True if the response body signals a valid-credential MFA challenge."""
+    for pat in _JSON_MFA_PATTERNS:
+        if pat.search(body_text):
+            return True
+    return False
 
 
 # ─────────────────────────────────────────────────────────────
@@ -457,7 +501,24 @@ def validate_token_login(sess, login_url: str, username: str, password: str,
         if r is None:
             continue
         best["status"] = r.status_code
-        body = _json_body(r)
+        body      = _json_body(r)
+        body_text = r.text or ""
+
+        # MFA challenge — credentials were valid; server wants a second factor
+        if _is_mfa_challenge(r, body_text):
+            mfa_types = _extract_mfa_types(body) if isinstance(body, dict) else []
+            best.update({
+                "success":       True,
+                "mfa_required":  True,
+                "mfa_types":     mfa_types,
+                "evidence":      (
+                    f"Credentials accepted — MFA challenge issued "
+                    f"(HTTP {r.status_code}, field combo: {ufield}/{pfield})"
+                    + (f". MFA types: {', '.join(mfa_types)}" if mfa_types else "")
+                ),
+                "field_combo":   f"{ufield}/{pfield}",
+            })
+            return best
 
         # Successful login — token in body
         if r.status_code in (200, 201) and isinstance(body, dict):
@@ -474,7 +535,6 @@ def validate_token_login(sess, login_url: str, username: str, password: str,
 
         # Auth endpoint confirmed — wrong creds
         if r.status_code in (400, 401, 403, 422):
-            body_text = r.text or ""
             for pat in _JSON_CRED_FAILURE_PATTERNS:
                 if pat.search(body_text):
                     best.update({
@@ -601,13 +661,21 @@ def _print_findings(findings: dict, args):
     if findings.get("validation_results"):
         _print_section("CREDENTIAL VALIDATION")
         for r in findings["validation_results"]:
-            ok    = r.get("success", False)
-            meth  = r.get("method", "?")
-            sc    = r.get("status", "?")
-            extra = r.get("evidence", r.get("redirected_to", ""))
-            icon  = green("✓ VALID") if ok else (
-                    yellow("~ CONFIRMED (wrong creds)") if r.get("endpoint_confirmed") else
-                    red("✗ FAILED"))
+            ok       = r.get("success", False)
+            mfa_req  = r.get("mfa_required", False)
+            meth     = r.get("method", "?")
+            sc       = r.get("status", "?")
+            extra    = r.get("evidence", r.get("redirected_to", ""))
+            if mfa_req:
+                mfa_types = r.get("mfa_types", [])
+                mfa_label = f"  [{', '.join(mfa_types)}]" if mfa_types else ""
+                icon = green(f"✓ VALID — MFA Required{mfa_label}")
+            elif ok:
+                icon = green("✓ VALID")
+            elif r.get("endpoint_confirmed"):
+                icon = yellow("~ CONFIRMED (wrong creds)")
+            else:
+                icon = red("✗ FAILED")
             print(f"  {icon}  method={bold(meth)}  status={sc}")
             if extra:
                 print(f"       {dim(extra)}")
