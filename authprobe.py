@@ -25,7 +25,7 @@ import sys
 import warnings
 from urllib.parse import urljoin, urlparse
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 # Suppress SSL warnings for testing
 warnings.filterwarnings("ignore")
@@ -146,6 +146,9 @@ _JSON_MFA_PATTERNS = [
     re.compile(r'"authenticators"\s*:\s*\[', re.I),
     re.compile(r'"mfaCookie"\s*:', re.I),
     re.compile(r'"mfa_cookie"\s*:', re.I),
+    # Ubiquiti UniFi OS specific
+    re.compile(r'"code"\s*:\s*"api\.err\.LoginMfaRequired"', re.I),
+    re.compile(r'"msg"\s*:\s*"api\.err\.LoginMfaRequired"', re.I),
 ]
 
 # URL path patterns that indicate a login/auth endpoint
@@ -181,6 +184,8 @@ _LOGIN_PROBE_PATHS = [
     "/user/login", "/users/login", "/account/login",
     "/api/v1/auth", "/api/v1/login", "/api/v2/auth", "/api/v2/login",
     "/api/v1/auth/login", "/api/v2/auth/login",
+    # Ubiquiti UniFi Controller / UISP
+    "/manage/account/login", "/nms/user/login", "/login.cgi",
 ]
 
 # Common field name combos for form/JSON login probing
@@ -726,6 +731,91 @@ SOFTWARE_FINGERPRINTS: list[dict] = [
             "body_keywords": ["__RequestVerificationToken", "ASP.NET", "__VIEWSTATE"],
         },
     },
+    # ── Ubiquiti Network Hardware ─────────────────────────────────────────────
+    {
+        "name": "Ubiquiti UniFi OS",
+        "url_type": "webapp",
+        "auth_methods": ["token_login", "totp_mfa"],
+        "indicators": {
+            "url_patterns":  [],
+            "html_patterns": [r"<title>\s*UniFi\s*OS\s*</title>",
+                              r"/manage/static/",
+                              r"window\.__ubnt\s*=",
+                              r'<link[^>]+href=["\'][^"\']*manage[^"\']*favicon'],
+            "headers":       {"x-csrf-token": None},
+            "cookies":       [r"^TOKEN$"],
+            "body_keywords": ["UniFi OS", "window.__ubnt", "/manage/static/"],
+        },
+        "login_url_hint": "/api/auth/login",
+        "login_username_field": "username",
+        "login_password_field": "password",
+    },
+    {
+        "name": "Ubiquiti UniFi Network Controller",
+        "url_type": "webapp",
+        "auth_methods": ["token_login", "totp_mfa"],
+        "indicators": {
+            "url_patterns":  [r":8443", r"/manage/"],
+            "html_patterns": [r'ng-app=["\']unifi["\']',
+                              r"<title>\s*UniFi\s*</title>",
+                              r"angular.*unifi|unifi.*angular",
+                              r"unifi-manage\.js"],
+            "headers":       {},
+            "cookies":       [r"^unifises", r"^csrf_token"],
+            "body_keywords": ["unifises", "ng-app=\"unifi\"", "unifi-manage"],
+        },
+        "login_url_hint": "/api/login",
+        "login_username_field": "username",
+        "login_password_field": "password",
+    },
+    {
+        "name": "Ubiquiti AirOS",
+        "url_type": "webapp",
+        "auth_methods": ["form_login"],
+        "indicators": {
+            "url_patterns":  [r"/airmax/"],
+            "html_patterns": [r"AirOS", r"airOS", r"ubnt.*(?:login|auth)",
+                              r"<title>\s*(?:airOS|AirOS)"],
+            "headers":       {"server": r"(?:lighttpd|AirOS|ubnt)"},
+            "cookies":       [r"^AIROS_SESSIONID"],
+            "body_keywords": ["AirOS", "airOS", "UBNT"],
+        },
+        "login_url_hint": "/login.cgi",
+        "login_username_field": "username",
+        "login_password_field": "password",
+    },
+    {
+        "name": "Ubiquiti UISP",
+        "url_type": "webapp",
+        "auth_methods": ["token_login", "totp_mfa"],
+        "indicators": {
+            "url_patterns":  [r"/nms/"],
+            "html_patterns": [r"<title>\s*UISP\s*</title>", r"uisp", r"UISP",
+                              r"/nms/static/"],
+            "headers":       {},
+            "cookies":       [r"^x-auth-token"],
+            "body_keywords": ["UISP", "uisp", "/nms/static/"],
+        },
+        "login_url_hint": "/nms/user/login",
+        "login_username_field": "email",
+        "login_password_field": "password",
+    },
+    {
+        "name": "Ubiquiti EdgeOS",
+        "url_type": "webapp",
+        "auth_methods": ["form_login", "token_login"],
+        "indicators": {
+            "url_patterns":  [],
+            "html_patterns": [r"<title>\s*EdgeOS\s*</title>", r"EdgeOS",
+                              r"edgeos", r"vyatta"],
+            "headers":       {"set-cookie": r"PHPSESSID"},
+            "cookies":       [r"^PHPSESSID"],
+            "body_keywords": ["EdgeOS", "edgerouter", "vyatta"],
+        },
+        "login_url_hint": "/",
+        "login_username_field": "username",
+        "login_password_field": "password",
+    },
 ]
 
 
@@ -1107,6 +1197,182 @@ def fingerprint_software(
 
 
 # ─────────────────────────────────────────────────────────────
+# Rendered-page fingerprinting (Selenium)
+# ─────────────────────────────────────────────────────────────
+
+# JS globals to probe for known frameworks / platforms
+_JS_GLOBALS_SIGNALS = [
+    ("window.__ubnt",       "Ubiquiti: window.__ubnt global detected"),
+    ("window.ubnt",         "Ubiquiti: window.ubnt global detected"),
+    ("window.unifi",        "Ubiquiti: window.unifi global detected"),
+    ("window.UniFiOS",      "Ubiquiti: window.UniFiOS global detected"),
+    ("window.angular",      "Angular framework detected"),
+    ("window.React",        "React framework detected"),
+    ("window.ReactDOM",     "React (DOM) framework detected"),
+    ("window.Vue",          "Vue.js framework detected"),
+    ("window.grafana",      "Grafana: window.grafana global detected"),
+    ("window.GF_USER",      "Grafana: GF_USER global detected"),
+    ("window.GF_SESS",      "Grafana: GF_SESS global detected"),
+    ("window.Keycloak",     "Keycloak: window.Keycloak global detected"),
+    ("window.OktaUtil",     "Okta: window.OktaUtil global detected"),
+]
+
+
+def fingerprint_rendered(
+    url: str,
+    timeout: int = 15,
+    proxy: str = "",
+    driver_path: str = "",
+) -> dict:
+    """
+    Render *url* in a headless Chrome browser and extract fingerprint signals
+    from the JavaScript-rendered DOM.
+
+    Returns::
+
+        {
+          "title":            str,
+          "visible_text":     str,
+          "rendered_html":    str (first 20 000 chars),
+          "software_matches": list,   # same schema as fingerprint_software()
+          "dom_signals":      list[str],
+          "rendered_cookies": list[str],
+          "error":            str,    # non-empty on failure
+        }
+
+    Returns {"error": "..."} immediately when Selenium is not installed.
+    """
+    result: dict = {
+        "title":            "",
+        "visible_text":     "",
+        "rendered_html":    "",
+        "software_matches": [],
+        "dom_signals":      [],
+        "rendered_cookies": [],
+        "error":            "",
+    }
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.chrome.service import Service
+        from selenium.common.exceptions import (
+            WebDriverException,
+            TimeoutException as _SeleniumTimeout,
+        )
+    except ImportError:
+        result["error"] = "selenium not available (pip install selenium)"
+        return result
+
+    opts = Options()
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--ignore-certificate-errors")
+    opts.add_argument("--allow-insecure-localhost")
+    opts.add_argument(f"--user-agent=AuthProbe/{VERSION} (Security Assessment)")
+    if proxy:
+        opts.add_argument(f"--proxy-server={proxy}")
+    # Suppress DevTools noise
+    opts.add_experimental_option("excludeSwitches", ["enable-logging"])
+
+    driver = None
+    try:
+        svc_kwargs: dict = {}
+        if driver_path:
+            svc_kwargs["executable_path"] = driver_path
+        try:
+            svc = Service(**svc_kwargs) if svc_kwargs else Service()
+            driver = webdriver.Chrome(service=svc, options=opts)
+        except WebDriverException as exc:
+            result["error"] = f"ChromeDriver init failed: {exc}"
+            return result
+
+        driver.set_page_load_timeout(timeout)
+        try:
+            driver.get(url)
+        except _SeleniumTimeout:
+            # Partial load may still yield useful signals
+            pass
+        except WebDriverException as exc:
+            result["error"] = f"Page load failed: {exc}"
+            return result
+
+        # Brief wait for JS to execute and render initial content
+        import time as _time
+        _time.sleep(min(3, timeout // 4))
+
+        result["title"] = driver.title or ""
+
+        try:
+            result["visible_text"] = (
+                driver.execute_script("return document.body ? document.body.innerText : '';")
+                or ""
+            )
+        except Exception:
+            pass
+
+        try:
+            result["rendered_html"] = driver.page_source[:20000]
+        except Exception:
+            pass
+
+        # Collect browser-set cookies
+        try:
+            result["rendered_cookies"] = [c["name"] for c in driver.get_cookies()]
+        except Exception:
+            pass
+
+        # Probe JS-level globals
+        dom_signals: list = []
+        for js_expr, signal in _JS_GLOBALS_SIGNALS:
+            try:
+                present = driver.execute_script(
+                    f"return typeof {js_expr} !== 'undefined';"
+                )
+                if present:
+                    dom_signals.append(signal)
+            except Exception:
+                pass
+
+        # Detect rendered <input type="password"> (SPAs render these dynamically)
+        try:
+            pw_inputs = driver.execute_script(
+                "return document.querySelectorAll('input[type=\"password\"]').length;"
+            )
+            if pw_inputs:
+                dom_signals.append(
+                    f"Rendered DOM: {pw_inputs} password input(s) found after JS execution"
+                )
+        except Exception:
+            pass
+
+        result["dom_signals"] = dom_signals
+
+        # Re-run static fingerprinting on the rendered HTML + title + visible text
+        combined_body = (
+            result["rendered_html"]
+            + "\n" + result["title"]
+            + "\n" + result["visible_text"]
+        )
+        sw_matches = fingerprint_software(
+            url, {}, combined_body, result["rendered_cookies"]
+        )
+        result["software_matches"] = sw_matches
+
+    except Exception as exc:
+        result["error"] = f"Rendering error: {exc}"
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────
 # Well-known / spec endpoint discovery
 # ─────────────────────────────────────────────────────────────
 
@@ -1362,8 +1628,6 @@ def detect_login_endpoints(sess, origin: str, timeout: int, probe_type: str,
     for path in _LOGIN_PROBE_PATHS:
         if path.rstrip("/") in skip_paths:
             continue
-        if probe_type == "webapp" and path.startswith("/api/"):
-            continue
         url = origin.rstrip("/") + path
         r = _safe_get(sess, url, timeout)
         if r and r.status_code in (200, 301, 302, 400, 401, 403, 422):
@@ -1614,6 +1878,11 @@ def _print_findings(findings: dict, args):
             colour = green if sc == 200 else yellow
             print(f"  {colour(str(sc))}  {key}: {info['url']}")
 
+    if findings.get("rendered_dom_signals"):
+        _print_section("RENDERED DOM SIGNALS")
+        for sig in findings["rendered_dom_signals"]:
+            print(f"  {cyan('»')}  {dim(sig)}")
+
     if findings.get("login_endpoints"):
         _print_section("LOGIN ENDPOINTS FOUND")
         for ep in findings["login_endpoints"]:
@@ -1738,10 +2007,14 @@ class AuthProbe:
         timeout: int = 10,
         proxy: str = "",
         verify_ssl: bool = False,
+        rendered: bool = False,
+        driver_path: str = "",
     ) -> None:
-        self.timeout    = timeout
-        self.proxy      = proxy
-        self.verify_ssl = verify_ssl
+        self.timeout     = timeout
+        self.proxy       = proxy
+        self.verify_ssl  = verify_ssl
+        self.rendered    = rendered
+        self.driver_path = driver_path
 
     def probe(self, url: str) -> dict:
         """Probe *url* and return a structured detection result."""
@@ -1811,11 +2084,53 @@ class AuthProbe:
         detect_session_cookies(base_resp, findings)
         detect_security_headers(base_resp, findings)
 
-        # Phase 3: Software fingerprinting
+        # Phase 3: Software fingerprinting (static HTML)
         cookie_names = [c.name for c in base_resp.cookies]
         sw_matches = fingerprint_software(
             full_url, dict(base_resp.headers), body, cookie_names
         )
+
+        # Phase 3b: Rendered-page fingerprinting (Selenium) if enabled
+        if self.rendered:
+            rendered_result = fingerprint_rendered(
+                full_url,
+                timeout=self.timeout + 5,
+                proxy=self.proxy,
+                driver_path=self.driver_path,
+            )
+            findings["rendered"] = rendered_result
+            # Merge rendered software matches (higher confidence wins)
+            existing_names = {m["name"] for m in sw_matches}
+            for rm in rendered_result.get("software_matches", []):
+                if rm["name"] not in existing_names:
+                    sw_matches.append(rm)
+                    existing_names.add(rm["name"])
+                else:
+                    # Boost existing match confidence if rendered confirms it
+                    for m in sw_matches:
+                        if m["name"] == rm["name"]:
+                            m["confidence"] = min(m["confidence"] + 20, 95)
+                            m["indicators"] += [
+                                f"[rendered] {s}" for s in rm.get("indicators", [])
+                            ]
+            # Inject rendered DOM signals into findings
+            findings["rendered_dom_signals"] = rendered_result.get("dom_signals", [])
+            # Re-run body-based signals on rendered HTML
+            rendered_body = (
+                rendered_result.get("rendered_html", "")
+                + "\n" + rendered_result.get("visible_text", "")
+            )
+            if rendered_body.strip():
+                detect_form_login(
+                    type("_FakeResp", (), {
+                        "status_code": 200,
+                        "headers": {"Content-Type": "text/html"},
+                        "text": rendered_body,
+                    })(),
+                    findings,
+                )
+
+        sw_matches.sort(key=lambda x: x["confidence"], reverse=True)
         findings["software_matches"] = sw_matches
 
         # Phase 4: Well-known / spec endpoint discovery
@@ -2008,6 +2323,10 @@ def main():
                         help="Output results as JSON")
     parser.add_argument("--no-verify",  action="store_true",
                         help="Disable SSL verification (already disabled by default)")
+    parser.add_argument("--rendered",   action="store_true",
+                        help="Render page with headless Chrome (Selenium) for SPA fingerprinting")
+    parser.add_argument("--driver-path", metavar="PATH", default="",
+                        help="Path to ChromeDriver binary (auto-detected if omitted)")
     args = parser.parse_args()
 
     raw_url = args.url.rstrip("/")
@@ -2088,12 +2407,59 @@ def main():
             "content_type": base_resp.headers.get("Content-Type", "")[:60] if base_resp else "",
         })
 
-    # Phase 2: Software fingerprinting
+    # Phase 2: Software fingerprinting (static HTML)
     print(f"  {dim('[2/5]')} Fingerprinting software…")
     cookie_names = [c.name for c in (base_resp.cookies if base_resp else [])]
     sw_matches = fingerprint_software(
         full_url, dict(base_resp.headers if base_resp else {}), body, cookie_names
     )
+
+    if getattr(args, "rendered", False):
+        print(f"  {dim('[2b/5]')} Rendering page (headless Chrome)…")
+        rendered_result = fingerprint_rendered(
+            full_url,
+            timeout=args.timeout + 5,
+            proxy=args.proxy,
+            driver_path=getattr(args, "driver_path", ""),
+        )
+        if rendered_result.get("error"):
+            print(f"          {yellow('!')} Rendered analysis: {rendered_result['error']}")
+        else:
+            r_title   = rendered_result.get("title", "")
+            r_signals = rendered_result.get("dom_signals", [])
+            if r_title:
+                print(f"          → Page title: {cyan(r_title)}")
+            for sig in r_signals:
+                print(f"          → {dim(sig)}")
+            # Merge rendered software matches
+            existing_names = {m["name"] for m in sw_matches}
+            for rm in rendered_result.get("software_matches", []):
+                if rm["name"] not in existing_names:
+                    sw_matches.append(rm)
+                    existing_names.add(rm["name"])
+                else:
+                    for m in sw_matches:
+                        if m["name"] == rm["name"]:
+                            m["confidence"] = min(m["confidence"] + 20, 95)
+                            m["indicators"] += [
+                                f"[rendered] {s}" for s in rm.get("indicators", [])
+                            ]
+            # Re-check form login in rendered HTML
+            rendered_body = (
+                rendered_result.get("rendered_html", "")
+                + "\n" + rendered_result.get("visible_text", "")
+            )
+            if rendered_body.strip():
+                detect_form_login(
+                    type("_FakeResp", (), {
+                        "status_code": 200,
+                        "headers": {"Content-Type": "text/html"},
+                        "text": rendered_body,
+                    })(),
+                    findings,
+                )
+        sw_matches.sort(key=lambda x: x["confidence"], reverse=True)
+
     findings["software_matches"] = sw_matches
     if sw_matches:
         print(f"          → Identified: {', '.join(sw['name'] for sw in sw_matches[:3])}")
