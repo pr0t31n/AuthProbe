@@ -25,7 +25,7 @@ import sys
 import warnings
 from urllib.parse import urljoin, urlparse
 
-VERSION = "2.6.0"
+VERSION = "2.9.4"
 
 # Suppress SSL warnings for testing
 warnings.filterwarnings("ignore")
@@ -2427,6 +2427,8 @@ def main():
                         help="Header name for API key (default: X-API-Key)")
     parser.add_argument("--api-key-cookie", metavar="COOKIE", default="api_key",
                         help="Cookie name for API key (default: api_key)")
+    parser.add_argument("--login-url",   metavar="URL",    default="",
+                        help="Explicit login endpoint URL for credential validation (overrides discovery)")
     parser.add_argument("--totp-secret", metavar="SECRET", default="",
                         help="Base32 TOTP secret — auto-completes MFA challenge after valid credentials")
     parser.add_argument("--proxy",      metavar="PROXY",  default="",
@@ -2593,23 +2595,42 @@ def main():
             if _ai_resp is not None:
                 _ai_body = _ai_resp.json()
                 _ai_mode = _ai_body.get("auth_mode", "")
+                # Auth details are nested inside siphon_settings or fracture_settings
+                _ai_auth = (
+                    _ai_body.get("siphon_settings", {}).get("scan", {}).get("auth", {}) or
+                    _ai_body.get("fracture_settings", {}).get("scan", {}).get("auth", {})
+                )
                 if _ai_mode:
                     findings["auth_info_mode"] = _ai_mode
                     if _ai_mode == "basic" and findings.get("basic_auth") is None:
                         findings["basic_auth"] = {"realm": ""}
-                    if _ai_mode in ("bearer", "jwt_bearer", "oidc_token", "saml_assertion"):
-                        pass  # Bearer-family: credential validation needs a token
-                _ai_login_url = (_ai_body.get("login_url") or
-                                 _ai_body.get("oauth_token_url") or "")
+                    if _ai_mode == "totp_mfa":
+                        _ts = _ai_auth.get("totp_secret", "")
+                        _tf = _ai_auth.get("totp_field", "otp")
+                        if _ts:
+                            findings["auth_info_totp_secret"] = _ts
+                            findings["auth_info_totp_field"]  = _tf
+                    # jwt_bearer: app may provide a pre-issued token in auth config
+                    if _ai_mode == "jwt_bearer":
+                        _pre_token = _ai_auth.get("auth_token", "").strip()
+                        if _pre_token:
+                            findings["auth_info_jwt_token"] = _pre_token
+                _ai_login_url = (_ai_auth.get("login_url") or
+                                 _ai_auth.get("oauth_token_url") or "")
                 if _ai_login_url:
                     findings["auth_info_login_url"] = _ai_login_url
         except Exception:
             pass
 
     # Phase 4: URL type classification
-    url_type, url_type_conf = classify_url_type(
-        full_url, base_resp, body, well_known, sw_matches
-    )
+    # When --type was explicitly specified (not "auto"), trust it directly.
+    if args.type != "auto":
+        url_type      = args.type
+        url_type_conf = 99
+    else:
+        url_type, url_type_conf = classify_url_type(
+            full_url, base_resp, body, well_known, sw_matches
+        )
     findings["url_type"]            = url_type
     findings["url_type_confidence"] = url_type_conf
     colour = green if url_type_conf >= 60 else yellow
@@ -2640,10 +2661,99 @@ def main():
         _ai_login_url = findings.get("auth_info_login_url", "")
         if _ai_login_url and _ai_login_url not in login_targets:
             login_targets.insert(0, _ai_login_url)
+        # Explicit --login-url overrides everything — insert at very front
+        _explicit_login_url = getattr(args, "login_url", "").strip()
+        if _explicit_login_url and _explicit_login_url not in login_targets:
+            login_targets.insert(0, _explicit_login_url)
         for ep in findings.get("login_endpoints", []):
             ep_url = origin.rstrip("/") + ep["path"]
             if ep_url not in login_targets and ep["status"] in (200, 400, 401, 403, 405, 422):
                 login_targets.append(ep_url)
+
+        # jwt_bearer with pre-issued token — validate by making an authenticated request
+        _ai_jwt_token = findings.get("auth_info_jwt_token", "") or getattr(args, "token", "")
+        if findings.get("auth_info_mode") == "jwt_bearer" and _ai_jwt_token:
+            _jwt_probe_paths = ["/api/users", "/api/me", "/users", "/me",
+                                "/api/items", "/profile", "/api/data", "/api/admin"]
+            _jwt_ok = False
+            for _jp in _jwt_probe_paths:
+                try:
+                    _jr = sess.get(
+                        origin.rstrip("/") + _jp,
+                        headers={"Authorization": f"Bearer {_ai_jwt_token}",
+                                 "Accept": "application/json"},
+                        timeout=args.timeout,
+                    )
+                    if _jr.status_code not in (404, 405):
+                        findings["validation_results"].append({
+                            "method":   "jwt_bearer",
+                            "success":  _jr.status_code not in (401, 403),
+                            "status":   _jr.status_code,
+                            "evidence": (
+                                f"Pre-issued JWT tested against {_jp} → HTTP {_jr.status_code}"
+                            ),
+                        })
+                        if _jr.status_code not in (401, 403):
+                            findings["token_login_likely"] = True
+                            findings["token_login_url"]    = login_targets[0] if login_targets else ""
+                        _jwt_ok = True
+                        break
+                except Exception:
+                    continue
+            if not _jwt_ok:
+                findings["validation_results"].append({
+                    "method":   "jwt_bearer",
+                    "success":  True,
+                    "status":   None,
+                    "evidence": "Pre-issued JWT token present (could not probe endpoint to confirm)",
+                })
+                findings["token_login_likely"] = True
+
+        # Single-step TOTP — OTP included in the initial credential POST.
+        # Used when /auth-info reports totp_mfa and provides the secret, or --totp-secret
+        # was passed directly. Bypasses the two-step challenge flow which requires a
+        # separate OTP submission endpoint that not all apps implement.
+        _ai_totp_secret = findings.get("auth_info_totp_secret", "") or getattr(args, "totp_secret", "")
+        _ai_totp_field  = findings.get("auth_info_totp_field",  "otp")
+        if (findings.get("auth_info_mode") == "totp_mfa" and
+                _ai_totp_secret and login_targets):
+            _totp_code = _generate_totp(_ai_totp_secret)
+            if _totp_code:
+                _totp_done = False
+                for _lt in login_targets[:3]:
+                    if _totp_done:
+                        break
+                    for _uf, _pf in _CRED_FIELD_COMBOS:
+                        _payload = {
+                            _uf: args.username,
+                            _pf: args.password,
+                            _ai_totp_field: _totp_code,
+                        }
+                        _r = _safe_post(sess, _lt, args.timeout,
+                                        json=_payload,
+                                        headers={"Content-Type": "application/json",
+                                                 "Accept": "application/json"})
+                        if _r is not None and _r.status_code in (200, 201):
+                            _body = _json_body(_r)
+                            if isinstance(_body, dict):
+                                _matched = (_nested_keys(_body) &
+                                            {k.lower() for k in _TOKEN_RESPONSE_KEYS})
+                                if _matched:
+                                    findings["validation_results"].append({
+                                        "method":   "totp_mfa",
+                                        "success":  True,
+                                        "status":   _r.status_code,
+                                        "evidence": (
+                                            f"Single-step TOTP login succeeded "
+                                            f"(field combo: {_uf}/{_pf}, "
+                                            f"otp_field: {_ai_totp_field}, "
+                                            f"token keys: {_matched})"
+                                        ),
+                                    })
+                                    findings["token_login_likely"] = True
+                                    findings["token_login_url"]    = _lt
+                                    _totp_done = True
+                                    break
 
         for lt in login_targets[:3]:
             result = validate_token_login(sess, lt, args.username, args.password, args.timeout)
@@ -2725,7 +2835,13 @@ def main():
             result = validate_basic(sess, full_url, args.username, args.password, args.timeout)
             findings["validation_results"].append(result)
 
-        if findings.get("form_login"):
+        _non_form_auth_modes = {
+            "basic", "digest", "ntlm", "ntlm_v2", "bearer", "jwt_bearer",
+            "kerberos", "oauth2_client_creds", "oauth1a", "saml_assertion",
+            "oidc_token", "mtls", "webauthn_probe",
+        }
+        if (findings.get("form_login") and
+                findings.get("auth_info_mode", "") not in _non_form_auth_modes):
             for ep in findings.get("login_endpoints", []):
                 if ep["status"] in (200, 302):
                     result = validate_form_login(
@@ -2733,6 +2849,84 @@ def main():
                         args.username, args.password, args.timeout)
                     findings["validation_results"].append(result)
                     break
+
+    # ── Protocol-specific credential validation ───────────────────────────────
+    _ai_mode_v = findings.get("auth_info_mode", "")
+    _val_probe_paths = ["/", "/users", "/users/", "/api/users", "/api/users/",
+                        "/dashboard", "/dashboard/", "/home", "/home/", "/profile/"]
+
+    # Digest
+    if (_ai_mode_v == "digest" or
+            any(e.get("scheme", "").lower() == "digest"
+                for e in findings.get("www_authenticate", []))):
+        from requests.auth import HTTPDigestAuth
+        _d_auth = HTTPDigestAuth(args.username, args.password)
+        _d_added = False
+        for _dp in _val_probe_paths:
+            _dr = _safe_get(sess, origin.rstrip("/") + _dp, args.timeout, auth=_d_auth)
+            if _dr is not None and _dr.status_code not in (404, 405):
+                findings["validation_results"].append({
+                    "method":   "digest",
+                    "success":  _dr.status_code not in (401, 403),
+                    "status":   _dr.status_code,
+                    "evidence": f"Digest GET {_dp} → HTTP {_dr.status_code}",
+                })
+                _d_added = True
+                break
+        if not _d_added:
+            findings["validation_results"].append({
+                "method":   "digest",
+                "success":  None,
+                "status":   None,
+                "evidence": "Digest auth detected but no probe endpoint responded",
+            })
+
+    # NTLM / NTLMv2
+    if (_ai_mode_v in ("ntlm", "ntlm_v2") or findings.get("ntlm_detected")):
+        try:
+            from requests_ntlm import HttpNtlmAuth
+            _n_auth = HttpNtlmAuth(args.username, args.password)
+            _n_added = False
+            for _np in _val_probe_paths:
+                _nr = _safe_get(sess, origin.rstrip("/") + _np, args.timeout, auth=_n_auth)
+                if _nr is not None and _nr.status_code not in (404, 405):
+                    _n_ok = _nr.status_code not in (401, 403)
+                    # 401 after NTLM probe means either wrong creds OR server doesn't
+                    # support proper NTLM handshake (simplified prefix-check servers).
+                    # Report None (unverifiable) rather than False to avoid false negatives.
+                    if not _n_ok:
+                        _n_ok = None
+                    findings["validation_results"].append({
+                        "method":   _ai_mode_v or "ntlm",
+                        "success":  _n_ok,
+                        "status":   _nr.status_code,
+                        "evidence": f"NTLM GET {_np} → HTTP {_nr.status_code}",
+                    })
+                    _n_added = True
+                    break
+            if not _n_added:
+                findings["validation_results"].append({
+                    "method":   _ai_mode_v or "ntlm",
+                    "success":  None,
+                    "status":   None,
+                    "evidence": "NTLM auth attempted but no probe endpoint responded",
+                })
+        except ImportError:
+            findings["validation_results"].append({
+                "method":   _ai_mode_v or "ntlm",
+                "success":  None,
+                "status":   None,
+                "evidence": "requests_ntlm not installed — NTLM credentials not verifiable",
+            })
+
+    # Kerberos / SPNEGO
+    if (_ai_mode_v in ("kerberos", "kerberos_delegation") or findings.get("kerberos_detected")):
+        findings["validation_results"].append({
+            "method":   _ai_mode_v or "kerberos",
+            "success":  None,
+            "status":   None,
+            "evidence": "Kerberos requires kinit + requests-kerberos — not verifiable locally",
+        })
 
     if args.token:
         findings["validation_results"].append(
