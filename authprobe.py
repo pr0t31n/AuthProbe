@@ -25,7 +25,7 @@ import sys
 import warnings
 from urllib.parse import urljoin, urlparse
 
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 
 # Suppress SSL warnings for testing
 warnings.filterwarnings("ignore")
@@ -1656,7 +1656,13 @@ def detect_login_endpoints(sess, origin: str, timeout: int, probe_type: str,
             continue
         url = origin.rstrip("/") + path
         r = _safe_get(sess, url, timeout)
-        if r is not None and r.status_code in (200, 301, 302, 400, 401, 403, 422):
+        # Many API login endpoints are POST-only; if GET returns 404/405 try POST
+        if r is None or r.status_code in (404, 405):
+            r = _safe_post(sess, url, timeout,
+                           json={},
+                           headers={"Content-Type": "application/json",
+                                    "Accept": "application/json"})
+        if r is not None and r.status_code in (200, 301, 302, 400, 401, 403, 405, 422):
             ct = r.headers.get("Content-Type", "").lower()
             if probe_type == "api" and r.status_code == 200 and "text/html" in ct:
                 continue
@@ -2579,6 +2585,27 @@ def main():
     if well_known:
         print(f"          → Found: {', '.join(well_known.keys())}")
 
+    # Phase 3b: /auth-info hint parsing (DV apps and compatible targets)
+    _ai = well_known.get("auth_info", {})
+    if _ai.get("status_code") == 200:
+        try:
+            _ai_resp = _safe_get(sess, _ai["url"], args.timeout)
+            if _ai_resp is not None:
+                _ai_body = _ai_resp.json()
+                _ai_mode = _ai_body.get("auth_mode", "")
+                if _ai_mode:
+                    findings["auth_info_mode"] = _ai_mode
+                    if _ai_mode == "basic" and findings.get("basic_auth") is None:
+                        findings["basic_auth"] = {"realm": ""}
+                    if _ai_mode in ("bearer", "jwt_bearer", "oidc_token", "saml_assertion"):
+                        pass  # Bearer-family: credential validation needs a token
+                _ai_login_url = (_ai_body.get("login_url") or
+                                 _ai_body.get("oauth_token_url") or "")
+                if _ai_login_url:
+                    findings["auth_info_login_url"] = _ai_login_url
+        except Exception:
+            pass
+
     # Phase 4: URL type classification
     url_type, url_type_conf = classify_url_type(
         full_url, base_resp, body, well_known, sw_matches
@@ -2609,9 +2636,13 @@ def main():
         login_targets = []
         if direct_login_url:
             login_targets.append(direct_login_url)
+        # Prefer /auth-info reported login URL — highest fidelity
+        _ai_login_url = findings.get("auth_info_login_url", "")
+        if _ai_login_url and _ai_login_url not in login_targets:
+            login_targets.insert(0, _ai_login_url)
         for ep in findings.get("login_endpoints", []):
             ep_url = origin.rstrip("/") + ep["path"]
-            if ep_url not in login_targets and ep["status"] in (200, 400, 401, 403, 422):
+            if ep_url not in login_targets and ep["status"] in (200, 400, 401, 403, 405, 422):
                 login_targets.append(ep_url)
 
         for lt in login_targets[:3]:
