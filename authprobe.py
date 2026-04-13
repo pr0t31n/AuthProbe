@@ -25,7 +25,7 @@ import sys
 import warnings
 from urllib.parse import urljoin, urlparse
 
-VERSION = "2.1.0"
+VERSION = "2.5.0"
 
 # Suppress SSL warnings for testing
 warnings.filterwarnings("ignore")
@@ -222,6 +222,9 @@ _WELL_KNOWN_ENDPOINTS = [
     ("v3_api_docs",          "/v3/api-docs"),
     ("graphql",              "/graphql"),
     ("graphql_playground",   "/playground"),
+    ("auth_info",            "/auth-info"),
+    ("wsdl",                 "/wsdl"),
+    ("soap_endpoint",        "/soap"),
 ]
 
 # URL path signals indicating API vs webapp
@@ -229,7 +232,7 @@ _API_URL_SIGNALS = [
     r"/api/v?\d+", r"/v\d+/", r"/rest/", r"/graphql", r"/gql",
     r"/swagger", r"/openapi", r"\.json$", r"/rpc/", r"/service/",
     r"/endpoint", r"/query", r"/_bulk", r"/_search", r"/oauth2/",
-    r"/token", r"\.well-known/",
+    r"/token", r"\.well-known/", r"/soap", r"/wsdl", r"\.wsdl$",
 ]
 
 _WEBAPP_URL_SIGNALS = [
@@ -1386,7 +1389,7 @@ def probe_well_known(sess, base_url: str, timeout: int) -> dict:
     for key, path in _WELL_KNOWN_ENDPOINTS:
         probe_url = origin.rstrip("/") + path
         r = _safe_get(sess, probe_url, max(5, timeout // 2))
-        if r and r.status_code in (200, 401, 403):
+        if r is not None and r.status_code in (200, 401, 403):
             ct = r.headers.get("content-type", "")
             body_snip = ""
             try:
@@ -1394,10 +1397,11 @@ def probe_well_known(sess, base_url: str, timeout: int) -> dict:
             except Exception:
                 pass
             found[key] = {
-                "url":         probe_url,
-                "status_code": r.status_code,
-                "is_json":     "json" in ct.lower(),
-                "body_snip":   body_snip,
+                "url":            probe_url,
+                "status_code":    r.status_code,
+                "is_json":        "json" in ct.lower(),
+                "body_snip":      body_snip,
+                "www_authenticate": r.headers.get("WWW-Authenticate", ""),
             }
     return found
 
@@ -1417,7 +1421,7 @@ def classify_url_type(
     api_score = 0
     web_score = 0
 
-    ct = (resp.headers.get("content-type", "") if resp else "").lower()
+    ct = (resp.headers.get("content-type", "") if resp is not None else "").lower()
     if "json" in ct or "xml" in ct:
         api_score += 30
     elif "html" in ct:
@@ -1438,6 +1442,10 @@ def classify_url_type(
         api_score += 30
     if "graphql" in well_known and well_known["graphql"]["status_code"] in (200, 400):
         api_score += 30
+    if "wsdl" in well_known and well_known["wsdl"]["status_code"] == 200:
+        api_score += 35
+    if "soap_endpoint" in well_known and well_known["soap_endpoint"]["status_code"] in (200, 400, 405, 500):
+        api_score += 20
 
     if body:
         if re.search(r'<html[\s>]', body, re.IGNORECASE):
@@ -1451,6 +1459,8 @@ def classify_url_type(
             api_score += 30
         if re.search(r'"apiVersion"\s*:', body):
             api_score += 20
+        if re.search(r'xmlns.*soap|soapenv:|<wsdl:|<definitions\s', body, re.IGNORECASE):
+            api_score += 30
 
     for sw in software_matches[:2]:
         sw_type = sw.get("url_type", "")
@@ -1459,7 +1469,7 @@ def classify_url_type(
         elif sw_type == "webapp":
             web_score += 20 * sw["confidence"] // 100
 
-    if resp and resp.status_code == 401:
+    if resp is not None and resp.status_code == 401:
         api_score += 10
 
     total = max(api_score + web_score, 1)
@@ -1586,6 +1596,22 @@ def detect_session_cookies(resp, findings: dict):
             findings["session_cookies"].append(cookie.name)
 
 
+_APIKEY_COOKIE_NAMES = re.compile(
+    r'^(api[_-]?key|x[_-]?api[_-]?key|auth[_-]?key|access[_-]?key|app[_-]?key|'
+    r'client[_-]?key|secret[_-]?key|private[_-]?key|apitoken|api[_-]?token)$',
+    re.I,
+)
+
+
+def detect_apikey_cookie(resp, findings: dict):
+    """Detect API-key-in-cookie auth by inspecting Set-Cookie headers."""
+    if resp is None:
+        return
+    for cookie in resp.cookies:
+        if _APIKEY_COOKIE_NAMES.match(cookie.name):
+            findings["apikey_cookie_hints"].append(cookie.name)
+
+
 def detect_security_headers(resp, findings: dict):
     if resp is None:
         return
@@ -1630,7 +1656,7 @@ def detect_login_endpoints(sess, origin: str, timeout: int, probe_type: str,
             continue
         url = origin.rstrip("/") + path
         r = _safe_get(sess, url, timeout)
-        if r and r.status_code in (200, 301, 302, 400, 401, 403, 422):
+        if r is not None and r.status_code in (200, 301, 302, 400, 401, 403, 422):
             ct = r.headers.get("Content-Type", "").lower()
             if probe_type == "api" and r.status_code == 200 and "text/html" in ct:
                 continue
@@ -1670,6 +1696,34 @@ def validate_bearer(sess, url: str, token: str, timeout: int) -> dict:
     ok = r is not None and r.status_code not in (401, 403)
     return {"method": "bearer", "success": ok,
             "status": r.status_code if r else None}
+
+
+def validate_apikey_cookie(sess, url: str, api_key: str,
+                          cookie_name: str, timeout: int) -> dict:
+    import copy
+    import requests
+    s2 = copy.copy(sess)
+    s2.cookies = requests.cookies.RequestsCookieJar()
+    s2.cookies.update(sess.cookies)
+    s2.cookies.set(cookie_name, api_key)
+    r = _safe_get(s2, url, timeout)
+    ok = r is not None and r.status_code not in (401, 403)
+    return {"method": "apikey_cookie", "success": ok,
+            "status": r.status_code if r else None,
+            "evidence": f"cookie {cookie_name}=<key>"}
+
+
+def validate_apikey_header(sess, url: str, api_key: str,
+                           header_name: str, timeout: int) -> dict:
+    import copy
+    s2 = copy.copy(sess)
+    s2.headers = dict(sess.headers)
+    s2.headers[header_name] = api_key
+    r = _safe_get(s2, url, timeout)
+    ok = r is not None and r.status_code not in (401, 403)
+    return {"method": "apikey_header", "success": ok,
+            "status": r.status_code if r else None,
+            "evidence": f"header {header_name}: <key>"}
 
 
 def validate_token_login(sess, login_url: str, username: str, password: str,
@@ -2034,6 +2088,7 @@ class AuthProbe:
             "oauth_discovery":       [],
             "session_cookies":       [],
             "api_key_header_hints":  [],
+            "apikey_cookie_hints":   [],
             "login_endpoints":       [],
             "security_headers":      {},
             "basic_auth":            None,
@@ -2042,6 +2097,7 @@ class AuthProbe:
             "validation_results":    [],
             "software_matches":      [],
             "well_known":            {},
+            "auth_info_mode":        "",
             "url_type":              "unknown",
             "url_type_confidence":   0,
         }
@@ -2082,6 +2138,7 @@ class AuthProbe:
         detect_json_api_auth(base_resp, full_url, findings)
         detect_token_login_response(base_resp, full_url, findings)
         detect_session_cookies(base_resp, findings)
+        detect_apikey_cookie(base_resp, findings)
         detect_security_headers(base_resp, findings)
 
         # Phase 3: Software fingerprinting (static HTML)
@@ -2136,6 +2193,29 @@ class AuthProbe:
         # Phase 4: Well-known / spec endpoint discovery
         well_known = probe_well_known(sess, full_url, self.timeout)
         findings["well_known"] = well_known
+
+        # Phase 4b: Auth challenges from well-known probe responses
+        for _wk_info in well_known.values():
+            ww = _wk_info.get("www_authenticate", "").lower()
+            if "negotiate" in ww:
+                findings["kerberos_detected"] = True
+            if "ntlm" in ww:
+                findings["ntlm_detected"] = True
+            if "basic" in ww and findings.get("basic_auth") is None:
+                findings["basic_auth"] = {"realm": ""}
+
+        # Phase 4c: /auth-info hint parsing
+        _ai = well_known.get("auth_info", {})
+        if _ai.get("is_json") and _ai.get("body_snip"):
+            try:
+                import json as _json
+                _ai_body = _json.loads(_ai["body_snip"]
+                                       if len(_ai["body_snip"]) < 290
+                                       else _safe_get(sess,
+                                           _ai["url"], self.timeout).text)
+                findings["auth_info_mode"] = _ai_body.get("auth_mode", "")
+            except Exception:
+                pass
 
         # Phase 5: URL type classification
         url_type, url_type_conf = classify_url_type(
@@ -2199,8 +2279,18 @@ class AuthProbe:
         # NTLM / Kerberos
         if findings.get("ntlm_detected"):
             _add("ntlm", 65, "NTLM detected in WWW-Authenticate")
+            _add("ntlm_v2", 40, "NTLM v2 likely alongside NTLM")
         if findings.get("kerberos_detected"):
             _add("kerberos", 65, "Negotiate/Kerberos detected in WWW-Authenticate")
+            _add("kerberos_delegation", 55, "Negotiate header — delegation variant possible")
+
+        # /auth-info hint (app self-reported auth mode)
+        _ai_mode = findings.get("auth_info_mode", "")
+        if _ai_mode:
+            _add(_ai_mode, 80, f"/auth-info reports auth_mode={_ai_mode}")
+            # If delegation reported, also score base kerberos
+            if _ai_mode == "kerberos_delegation":
+                _add("kerberos", 50, "kerberos_delegation implies kerberos capable")
 
         # Basic auth
         if findings.get("basic_auth") is not None:
@@ -2232,6 +2322,18 @@ class AuthProbe:
         if findings.get("api_key_header_hints"):
             _add("apikey_header", 45,
                  f"API key headers: {', '.join(findings['api_key_header_hints'][:2])}")
+
+        # API key cookie hints
+        if findings.get("apikey_cookie_hints"):
+            _add("apikey_cookie", 55,
+                 f"API key cookies: {', '.join(findings['apikey_cookie_hints'][:2])}")
+
+        # API key validated via cookie
+        for vr in findings.get("validation_results", []):
+            if vr.get("method") == "apikey_cookie" and vr.get("success"):
+                _add("apikey_cookie", 40, "API key cookie validation succeeded")
+            elif vr.get("method") == "apikey_header" and vr.get("success"):
+                _add("apikey_header", 40, "API key header validation succeeded")
 
         # Well-known endpoints
         if "openid_configuration" in well_known:
@@ -2313,6 +2415,12 @@ def main():
                         help="Password for credential validation")
     parser.add_argument("--token",      metavar="TOKEN",  default="",
                         help="Bearer token for credential validation")
+    parser.add_argument("--api-key",    metavar="KEY",    default="",
+                        help="API key value for apikey_header / apikey_cookie validation")
+    parser.add_argument("--api-key-header", metavar="HEADER", default="X-API-Key",
+                        help="Header name for API key (default: X-API-Key)")
+    parser.add_argument("--api-key-cookie", metavar="COOKIE", default="api_key",
+                        help="Cookie name for API key (default: api_key)")
     parser.add_argument("--totp-secret", metavar="SECRET", default="",
                         help="Base32 TOTP secret — auto-completes MFA challenge after valid credentials")
     parser.add_argument("--proxy",      metavar="PROXY",  default="",
@@ -2387,7 +2495,7 @@ def main():
 
     body = ""
     try:
-        body = (base_resp.text if base_resp else "")[:8000]
+        body = (base_resp.text if base_resp is not None else "")[:8000]
     except Exception:
         pass
 
@@ -2403,15 +2511,15 @@ def main():
     if given_is_login_path:
         findings["login_endpoints"].append({
             "path": url_path,
-            "status": base_resp.status_code if base_resp else 0,
-            "content_type": base_resp.headers.get("Content-Type", "")[:60] if base_resp else "",
+            "status": base_resp.status_code if base_resp is not None else 0,
+            "content_type": base_resp.headers.get("Content-Type", "")[:60] if base_resp is not None else "",
         })
 
     # Phase 2: Software fingerprinting (static HTML)
     print(f"  {dim('[2/5]')} Fingerprinting software…")
-    cookie_names = [c.name for c in (base_resp.cookies if base_resp else [])]
+    cookie_names = [c.name for c in (base_resp.cookies if base_resp is not None else [])]
     sw_matches = fingerprint_software(
-        full_url, dict(base_resp.headers if base_resp else {}), body, cookie_names
+        full_url, dict(base_resp.headers if base_resp is not None else {}), body, cookie_names
     )
 
     if getattr(args, "rendered", False):
@@ -2484,7 +2592,7 @@ def main():
     print(f"  {dim('[4/5]')} Probing login endpoints from origin…")
     if given_is_login_path:
         root_resp = _safe_get(sess, origin, args.timeout)
-        if root_resp:
+        if root_resp is not None:
             detect_www_authenticate(root_resp, findings)
             detect_basic_auth(root_resp, findings)
             detect_ntlm_kerberos(root_resp, findings)
@@ -2598,6 +2706,14 @@ def main():
     if args.token:
         findings["validation_results"].append(
             validate_bearer(sess, full_url, args.token, args.timeout))
+
+    if args.api_key:
+        findings["validation_results"].append(
+            validate_apikey_cookie(sess, full_url, args.api_key,
+                                   args.api_key_cookie, args.timeout))
+        findings["validation_results"].append(
+            validate_apikey_header(sess, full_url, args.api_key,
+                                   args.api_key_header, args.timeout))
 
     if args.json:
         print(json.dumps(findings, indent=2))
