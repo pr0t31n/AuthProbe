@@ -25,7 +25,7 @@ import sys
 import warnings
 from urllib.parse import urljoin, urlparse
 
-VERSION = "2.9.7"
+VERSION = "2.10.0"
 
 # Suppress SSL warnings for testing
 warnings.filterwarnings("ignore")
@@ -1992,7 +1992,9 @@ def _print_findings(findings: dict, args):
                 print(f"       {dim(extra)}")
 
     _print_section("RECOMMENDED AUTH METHOD FOR FRACTURE / SIPHON")
-    # Use software hints if available
+    # Validated methods take priority over detected-only methods
+    _form_confirmed_url  = findings.get("form_login_confirmed_url", "")
+    _token_confirmed_url = findings.get("token_login_url", "")
     sw_matches = findings.get("software_matches", [])
     if sw_matches and sw_matches[0].get("auth_hints"):
         best_method = sw_matches[0]["auth_hints"][0]
@@ -2003,14 +2005,18 @@ def _print_findings(findings: dict, args):
         print(f"  → {bold('kerberos')}  (requires requests-kerberos + kinit)")
     elif findings.get("oauth_discovery"):
         print(f"  → {bold('oauth2_client_creds')}  (or bearer with pre-obtained token)")
-    elif findings.get("token_login_likely"):
-        url = findings.get("token_login_url", "")
-        print(f"  → {bold('token_login')}  (POST credentials to {url})")
+    elif _form_confirmed_url:
+        print(f"  → {bold('form_login')}  {green('(validated)')}  (POST credentials to {_form_confirmed_url})")
+    elif _token_confirmed_url:
+        print(f"  → {bold('token_login')}  {green('(validated)')}  (POST credentials to {_token_confirmed_url})")
     elif findings.get("json_api_auth"):
         url = findings.get("json_api_auth_url", "")
         print(f"  → {bold('token_login')}  (POST credentials to {url})")
     elif findings.get("form_login"):
-        print(f"  → {bold('form_login')}  (POST credentials to login form)")
+        print(f"  → {bold('form_login')}  (POST credentials to login form — not yet validated)")
+    elif findings.get("token_login_likely"):
+        url = findings.get("token_login_url", "")
+        print(f"  → {bold('token_login')}  (POST credentials to {url})")
     elif findings.get("basic_auth") is not None:
         print(f"  → {bold('basic')}  (HTTP Basic Auth)")
     elif findings.get("session_cookies"):
@@ -2020,13 +2026,24 @@ def _print_findings(findings: dict, args):
     else:
         print(f"  → {yellow('unknown')}  (manual inspection recommended)")
 
-    # Siphon/Fracture config snippet
-    if findings.get("json_api_auth") or findings.get("token_login_likely"):
-        url = findings.get("token_login_url") or findings.get("json_api_auth_url", "")
+    # Fracture / Siphon config snippet — shown for any validated login method
+    if _form_confirmed_url:
+        vr = findings.get("validation_results", [])
+        fl = next((r for r in vr if r.get("method") == "form_login" and r.get("success")), None)
+        uf = (fl.get("username_field", "username") if fl else "username")
+        pf = (fl.get("password_field", "password") if fl else "password")
+        print(f"\n  {dim('Fracture / Siphon config snippet:')}")
+        print(f'  {dim("scan.auth.method")}                = {cyan("form_login")}')
+        print(f'  {dim("scan.auth.login_url")}             = {cyan(_form_confirmed_url)}')
+        print(f'  {dim("scan.auth.login_username_field")}  = {cyan(uf)}')
+        print(f'  {dim("scan.auth.login_password_field")}  = {cyan(pf)}')
+        print(f'  {dim("scan.auth.login_content_type")}    = {cyan("application/x-www-form-urlencoded")}')
+    elif findings.get("json_api_auth") or _token_confirmed_url:
+        url = _token_confirmed_url or findings.get("json_api_auth_url", "")
         vr  = findings.get("validation_results", [])
         tl  = next((r for r in vr if r.get("method") == "token_login"), None)
         combo_hint = f"  # field combo: {tl['field_combo']}" if tl and tl.get("field_combo") else ""
-        print(f"\n  {dim('Siphon config snippet:')}")
+        print(f"\n  {dim('Fracture / Siphon config snippet:')}")
         print(f'  {dim("scan.auth.method")}           = {cyan("token_login")}')
         print(f'  {dim("scan.auth.login_url")}        = {cyan(url)}')
         if combo_hint:
@@ -2651,6 +2668,8 @@ def main():
     # Credential validation
     if args.username and args.password:
         print(f"  {dim('[+]')} Credential validation…")
+        _auth_success = False  # stop further method attempts once one succeeds
+
         login_targets = []
         if direct_login_url:
             login_targets.append(direct_login_url)
@@ -2693,6 +2712,7 @@ def main():
                         if _jr.status_code not in (401, 403):
                             findings["token_login_likely"] = True
                             findings["token_login_url"]    = login_targets[0] if login_targets else ""
+                            _auth_success = True
                         _jwt_ok = True
                         break
                 except Exception:
@@ -2705,6 +2725,7 @@ def main():
                     "evidence": "Pre-issued JWT token present (could not probe endpoint to confirm)",
                 })
                 findings["token_login_likely"] = True
+                _auth_success = True
 
         # Single-step TOTP — OTP included in the initial credential POST.
         # Used when /auth-info reports totp_mfa and provides the secret, or --totp-secret
@@ -2749,113 +2770,132 @@ def main():
                                     })
                                     findings["token_login_likely"] = True
                                     findings["token_login_url"]    = _lt
+                                    _auth_success = True
                                     _totp_done = True
                                     break
-
-        for lt in login_targets[:3]:
-            result = validate_token_login(sess, lt, args.username, args.password, args.timeout)
-            findings["validation_results"].append(result)
-            if result.get("success") or result.get("endpoint_confirmed"):
-                if result.get("success") and not result.get("mfa_required"):
-                    findings["token_login_likely"] = True
-                    findings["token_login_url"]    = lt
-                elif result.get("mfa_required"):
-                    findings["token_login_likely"] = True
-                    findings["token_login_url"]    = lt
-                    findings["mfa_required"]       = True
-                    findings["mfa_types"]          = result.get("mfa_types", [])
-                    totp_secret = getattr(args, "totp_secret", "").strip()
-                    if totp_secret and "totp" in [t.lower() for t in result.get("mfa_types", [])]:
-                        totp_code = _generate_totp(totp_secret)
-                        if totp_code:
-                            print(f"  {dim('[+]')} Completing TOTP MFA challenge…")
-                            _, lt_path, _ = _split_url(lt)
-                            totp_result = complete_totp(
-                                sess, origin, lt_path,
-                                result.get("mfa_cookie_name", ""),
-                                result.get("mfa_cookie_value", ""),
-                                totp_code,
-                                result.get("totp_authenticator_id", ""),
-                                args.timeout,
-                            )
-                            findings["validation_results"].append(totp_result)
-                            if totp_result.get("success"):
-                                findings["token_login_likely"] = True
-                                findings["token_login_url"]    = totp_result.get("endpoint", lt)
-                        else:
-                            findings["validation_results"].append({
-                                "method":   "totp_mfa",
-                                "success":  False,
-                                "status":   None,
-                                "evidence": "pyotp not installed — run: pip install pyotp",
-                            })
-                    elif totp_secret:
-                        findings["validation_results"].append({
-                            "method":   "totp_mfa",
-                            "success":  False,
-                            "status":   None,
-                            "evidence": (
-                                f"--totp-secret provided but TOTP not in MFA types "
-                                f"({result.get('mfa_types', [])}). "
-                                "Skipping TOTP completion."
-                            ),
-                        })
-                    elif not args.json:
-                        mfa_types_str = ", ".join(result.get("mfa_types", [])) or "unknown"
-                        print(f"\n  {yellow('MFA challenge received')}  [{mfa_types_str}]")
-                        try:
-                            totp_code = input(f"  Enter TOTP code: ").strip()
-                        except (EOFError, KeyboardInterrupt):
-                            totp_code = ""
-                        if totp_code:
-                            print(f"  {dim('[+]')} Submitting TOTP code…")
-                            _, lt_path, _ = _split_url(lt)
-                            totp_result = complete_totp(
-                                sess, origin, lt_path,
-                                result.get("mfa_cookie_name", ""),
-                                result.get("mfa_cookie_value", ""),
-                                totp_code,
-                                result.get("totp_authenticator_id", ""),
-                                args.timeout,
-                            )
-                            findings["validation_results"].append(totp_result)
-                            if totp_result.get("success"):
-                                findings["token_login_likely"] = True
-                                findings["token_login_url"]    = totp_result.get("endpoint", lt)
-                else:
-                    findings["json_api_auth"]         = True
-                    findings["json_api_auth_url"]     = lt
-                    findings["json_api_cred_checked"] = True
-                break
-
-        if findings.get("basic_auth") is not None:
-            result = validate_basic(sess, full_url, args.username, args.password, args.timeout)
-            findings["validation_results"].append(result)
 
         _non_form_auth_modes = {
             "basic", "digest", "ntlm", "ntlm_v2", "bearer", "jwt_bearer",
             "kerberos", "oauth2_client_creds", "oauth1a", "saml_assertion",
             "oidc_token", "mtls", "webauthn_probe",
         }
-        if (findings.get("form_login") and
+
+        # ── form_login — tested FIRST when detected ───────────────────────────
+        # Builds its own target list: login_targets (honours --login-url) first,
+        # then any discovered endpoints not already in the list.
+        if (not _auth_success and
+                findings.get("form_login") and
                 findings.get("auth_info_mode", "") not in _non_form_auth_modes):
+            _form_targets = list(login_targets)
             for ep in findings.get("login_endpoints", []):
-                if ep["status"] in (200, 302):
-                    result = validate_form_login(
-                        sess, origin.rstrip("/") + ep["path"],
-                        args.username, args.password, args.timeout)
-                    findings["validation_results"].append(result)
+                ep_url = origin.rstrip("/") + ep["path"]
+                if ep_url not in _form_targets and ep["status"] in (200, 302):
+                    _form_targets.append(ep_url)
+            for ft in _form_targets[:3]:
+                result = validate_form_login(sess, ft, args.username, args.password, args.timeout)
+                findings["validation_results"].append(result)
+                if result.get("success"):
+                    findings["form_login_confirmed_url"] = ft
+                    _auth_success = True
                     break
+
+        # ── token_login — only if form_login did not succeed ──────────────────
+        if not _auth_success:
+            for lt in login_targets[:3]:
+                result = validate_token_login(sess, lt, args.username, args.password, args.timeout)
+                findings["validation_results"].append(result)
+                if result.get("success") or result.get("endpoint_confirmed"):
+                    if result.get("success") and not result.get("mfa_required"):
+                        findings["token_login_likely"] = True
+                        findings["token_login_url"]    = lt
+                        _auth_success = True
+                    elif result.get("mfa_required"):
+                        findings["token_login_likely"] = True
+                        findings["token_login_url"]    = lt
+                        findings["mfa_required"]       = True
+                        findings["mfa_types"]          = result.get("mfa_types", [])
+                        _auth_success = True
+                        totp_secret = getattr(args, "totp_secret", "").strip()
+                        if totp_secret and "totp" in [t.lower() for t in result.get("mfa_types", [])]:
+                            totp_code = _generate_totp(totp_secret)
+                            if totp_code:
+                                print(f"  {dim('[+]')} Completing TOTP MFA challenge…")
+                                _, lt_path, _ = _split_url(lt)
+                                totp_result = complete_totp(
+                                    sess, origin, lt_path,
+                                    result.get("mfa_cookie_name", ""),
+                                    result.get("mfa_cookie_value", ""),
+                                    totp_code,
+                                    result.get("totp_authenticator_id", ""),
+                                    args.timeout,
+                                )
+                                findings["validation_results"].append(totp_result)
+                                if totp_result.get("success"):
+                                    findings["token_login_likely"] = True
+                                    findings["token_login_url"]    = totp_result.get("endpoint", lt)
+                            else:
+                                findings["validation_results"].append({
+                                    "method":   "totp_mfa",
+                                    "success":  False,
+                                    "status":   None,
+                                    "evidence": "pyotp not installed — run: pip install pyotp",
+                                })
+                        elif totp_secret:
+                            findings["validation_results"].append({
+                                "method":   "totp_mfa",
+                                "success":  False,
+                                "status":   None,
+                                "evidence": (
+                                    f"--totp-secret provided but TOTP not in MFA types "
+                                    f"({result.get('mfa_types', [])}). "
+                                    "Skipping TOTP completion."
+                                ),
+                            })
+                        elif not args.json:
+                            mfa_types_str = ", ".join(result.get("mfa_types", [])) or "unknown"
+                            print(f"\n  {yellow('MFA challenge received')}  [{mfa_types_str}]")
+                            try:
+                                totp_code = input(f"  Enter TOTP code: ").strip()
+                            except (EOFError, KeyboardInterrupt):
+                                totp_code = ""
+                            if totp_code:
+                                print(f"  {dim('[+]')} Submitting TOTP code…")
+                                _, lt_path, _ = _split_url(lt)
+                                totp_result = complete_totp(
+                                    sess, origin, lt_path,
+                                    result.get("mfa_cookie_name", ""),
+                                    result.get("mfa_cookie_value", ""),
+                                    totp_code,
+                                    result.get("totp_authenticator_id", ""),
+                                    args.timeout,
+                                )
+                                findings["validation_results"].append(totp_result)
+                                if totp_result.get("success"):
+                                    findings["token_login_likely"] = True
+                                    findings["token_login_url"]    = totp_result.get("endpoint", lt)
+                    else:
+                        findings["json_api_auth"]         = True
+                        findings["json_api_auth_url"]     = lt
+                        findings["json_api_cred_checked"] = True
+                    break
+
+        # ── basic_auth — only if no method has succeeded yet ─────────────────
+        if not _auth_success and findings.get("basic_auth") is not None:
+            result = validate_basic(sess, full_url, args.username, args.password, args.timeout)
+            findings["validation_results"].append(result)
+            if result.get("success"):
+                _auth_success = True
 
     # ── Protocol-specific credential validation ───────────────────────────────
     _ai_mode_v = findings.get("auth_info_mode", "")
     _val_probe_paths = ["/", "/users", "/users/", "/api/users", "/api/users/",
                         "/dashboard", "/dashboard/", "/home", "/home/", "/profile/"]
 
-    # Digest
-    if (_ai_mode_v == "digest" or
-            any(e.get("scheme", "").lower() == "digest"
-                for e in findings.get("www_authenticate", []))):
+    # Digest — only if no method has already succeeded
+    if (not _auth_success and
+            (_ai_mode_v == "digest" or
+             any(e.get("scheme", "").lower() == "digest"
+                 for e in findings.get("www_authenticate", [])))):
         from requests.auth import HTTPDigestAuth
         _d_auth = HTTPDigestAuth(args.username, args.password)
         _d_added = False
@@ -2878,8 +2918,9 @@ def main():
                 "evidence": "Digest auth detected but no probe endpoint responded",
             })
 
-    # NTLM / NTLMv2
-    if (_ai_mode_v in ("ntlm", "ntlm_v2") or findings.get("ntlm_detected")):
+    # NTLM / NTLMv2 — only if no method has already succeeded
+    if (not _auth_success and
+            (_ai_mode_v in ("ntlm", "ntlm_v2") or findings.get("ntlm_detected"))):
         try:
             from requests_ntlm import HttpNtlmAuth
             _n_auth = HttpNtlmAuth(args.username, args.password)
