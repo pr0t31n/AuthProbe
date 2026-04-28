@@ -25,7 +25,7 @@ import sys
 import warnings
 from urllib.parse import urljoin, urlparse
 
-VERSION = "2.10.0"
+VERSION = "2.10.1"
 
 # Suppress SSL warnings for testing
 warnings.filterwarnings("ignore")
@@ -2666,9 +2666,9 @@ def main():
     detect_oauth_discovery(sess, origin, args.timeout, findings)
 
     # Credential validation
+    _auth_success = False  # initialised here so protocol-specific blocks below are always valid
     if args.username and args.password:
         print(f"  {dim('[+]')} Credential validation…")
-        _auth_success = False  # stop further method attempts once one succeeds
 
         login_targets = []
         if direct_login_url:
