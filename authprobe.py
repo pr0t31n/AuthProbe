@@ -25,7 +25,7 @@ import sys
 import warnings
 from urllib.parse import urljoin, urlparse
 
-VERSION = "2.10.1"
+VERSION = "2.11.0"
 
 # Suppress SSL warnings for testing
 warnings.filterwarnings("ignore")
@@ -1837,6 +1837,145 @@ def validate_form_login(sess, login_url: str, username: str, password: str,
 
 
 # ─────────────────────────────────────────────────────────────
+# Login-profile store integration
+# ─────────────────────────────────────────────────────────────
+_LP_INDEX_PATH_AP = Path("/opt/pr0t31n/Fracture/login_profiles/index.json")
+
+
+def _lp_fingerprint_url_ap(url: str) -> dict:
+    """Minimal structural fingerprint of *url*'s login page for profile matching."""
+    import html.parser as _hp
+    fp: dict = {
+        "input_count":        0,
+        "has_password_field": False,
+        "has_hidden_fields":  False,
+        "hidden_field_count": 0,
+        "form_action_path":   "",
+        "form_action_depth":  0,
+        "form_method":        "POST",
+        "login_path":         "",
+        "framework_hints":    [],
+    }
+    try:
+        import requests as _req
+        r   = _req.get(url, timeout=8, verify=False, allow_redirects=True)
+        htm = r.text
+        fp["login_path"] = urlparse(r.url).path.rstrip("/").split("/")[-1].lower()
+
+        class _P(_hp.HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.in_form = False
+                self.inputs: list = []
+                self.faction = ""
+                self.fmethod = "POST"
+
+            def handle_starttag(self, tag, attrs):
+                a = dict(attrs)
+                if tag == "form":
+                    self.in_form = True
+                    self.faction = a.get("action", "")
+                    self.fmethod = (a.get("method") or "post").upper()
+                elif tag == "input" and self.in_form:
+                    self.inputs.append(a)
+
+            def handle_endtag(self, tag):
+                if tag == "form":
+                    self.in_form = False
+
+        p = _P()
+        p.feed(htm)
+        fp["input_count"]        = len(p.inputs)
+        fp["has_password_field"] = any(i.get("type", "").lower() == "password"
+                                       for i in p.inputs)
+        hidden                   = [i for i in p.inputs
+                                    if i.get("type", "").lower() == "hidden"]
+        fp["has_hidden_fields"]  = bool(hidden)
+        fp["hidden_field_count"] = len(hidden)
+        fp["form_method"]        = p.fmethod
+        if p.faction:
+            _ap = urlparse(p.faction).path
+            fp["form_action_path"]  = _ap
+            fp["form_action_depth"] = len([s for s in _ap.split("/") if s])
+
+        _fh: list = []
+        if "wp-login" in htm or "WordPress" in htm:
+            _fh.append("wordpress")
+        if "csrfmiddlewaretoken" in htm or "django" in htm.lower():
+            _fh.append("django")
+        if 'name="_token"' in htm or "laravel" in htm.lower():
+            _fh.append("laravel")
+        if "authenticity_token" in htm:
+            _fh.append("rails")
+        fp["framework_hints"] = _fh
+    except Exception:
+        pass
+    return fp
+
+
+def _lp_score_ap(observed: dict, stored: dict) -> float:
+    """Score observed fingerprint against a stored profile fingerprint."""
+    pts = total = 0.0
+
+    def _w(key: str, weight: float) -> None:
+        nonlocal pts, total
+        total += weight
+        if observed.get(key) == stored.get(key):
+            pts += weight
+
+    _w("has_password_field", 3.0)
+    _w("has_hidden_fields",  2.0)
+    _w("form_method",        1.0)
+    _w("form_action_depth",  1.0)
+    total += 2.0
+    diff   = abs(observed.get("input_count", 0) - stored.get("input_count", 0))
+    pts   += 2.0 if diff == 0 else (1.0 if diff == 1 else 0.0)
+    o_h    = set(observed.get("framework_hints", []))
+    s_h    = set(stored.get("framework_hints",  []))
+    total += 2.0
+    if o_h and s_h:
+        pts += 2.0 * len(o_h & s_h) / max(len(o_h), len(s_h))
+    elif not o_h and not s_h:
+        pts += 2.0
+    total += 1.0
+    o_p    = observed.get("login_path", "").lower()
+    s_p    = stored.get("login_path",  "").lower()
+    if o_p and s_p:
+        if o_p == s_p:
+            pts += 1.0
+        elif o_p in s_p or s_p in o_p:
+            pts += 0.5
+    return round(pts / total, 3) if total > 0 else 0.0
+
+
+def _lp_match_from_index(url: str) -> "dict | None":
+    """
+    Check the Fracture login-profile index for a structural match against *url*.
+    Returns the best matching index entry with an added 'confidence' key (0-100),
+    or None if the index is absent or no entry scores >= 75%.
+    """
+    if not _LP_INDEX_PATH_AP.exists():
+        return None
+    try:
+        index = json.loads(_LP_INDEX_PATH_AP.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not index:
+        return None
+    observed = _lp_fingerprint_url_ap(url)
+    best_s: float         = 0.0
+    best_e: "dict | None" = None
+    for entry in index:
+        s = _lp_score_ap(observed, entry.get("fingerprint", {}))
+        if s > best_s:
+            best_s = s
+            best_e = entry
+    if best_s >= 0.75 and best_e:
+        return {**best_e, "confidence": int(best_s * 100)}
+    return None
+
+
+# ─────────────────────────────────────────────────────────────
 # Report
 # ─────────────────────────────────────────────────────────────
 
@@ -1990,6 +2129,20 @@ def _print_findings(findings: dict, args):
 
             if extra:
                 print(f"       {dim(extra)}")
+
+    if findings.get("login_profile_match"):
+        _lpm = findings["login_profile_match"]
+        _print_section("LOGIN PROFILE MATCH")
+        _conf = _lpm.get("confidence", 0)
+        _conf_colour = green if _conf >= 90 else (yellow if _conf >= 75 else red)
+        print(f"  {green('✓')}  Profile ID:    {bold(_lpm.get('id','?'))}")
+        print(f"       Confidence:  {_conf_colour(str(_conf) + '%')}")
+        print(f"       Recorded on: {dim(_lpm.get('target_url','?'))}")
+        print(f"       Created:     {dim(_lpm.get('created','?'))}")
+        print(f"       Description: {dim(_lpm.get('description',''))}")
+        print(f"\n  {dim('Fracture will replay this profile automatically.')}")
+        print(f"  {dim('To override, set fr_auth_login_profile_id to a different profile ID')}")
+        print(f"  {dim('or set it to empty to force a fresh browser-assisted login.')}")
 
     _print_section("RECOMMENDED AUTH METHOD FOR FRACTURE / SIPHON")
     # Validated methods take priority over detected-only methods
@@ -2977,6 +3130,18 @@ def main():
         findings["validation_results"].append(
             validate_apikey_header(sess, full_url, args.api_key,
                                    args.api_key_header, args.timeout))
+
+    # ── Login profile store check ─────────────────────────────────────────────
+    # Run only when the target looks like a web login page (form_login detected
+    # or html URL type) so we don't waste a GET against pure API endpoints.
+    _lp_candidate = None
+    if findings.get("form_login") or findings.get("url_type") == "webapp":
+        try:
+            _lp_candidate = _lp_match_from_index(full_url)
+            if _lp_candidate:
+                findings["login_profile_match"] = _lp_candidate
+        except Exception:
+            pass
 
     if args.json:
         print(json.dumps(findings, indent=2))
