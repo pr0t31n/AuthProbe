@@ -25,7 +25,7 @@ import sys
 import warnings
 from urllib.parse import urljoin, urlparse
 
-VERSION = "2.11.0"
+VERSION = "2.12.0"
 
 # Suppress SSL warnings for testing
 warnings.filterwarnings("ignore")
@@ -2610,6 +2610,15 @@ def main():
                         help="Render page with headless Chrome (Selenium) for SPA fingerprinting")
     parser.add_argument("--driver-path", metavar="PATH", default="",
                         help="Path to ChromeDriver binary (auto-detected if omitted)")
+    parser.add_argument("--output-dir",  metavar="DIR",  default="",
+                        help="Write meta.json + findings.json + summary.json (schema 1.0) "
+                             "to DIR for ingestion by Prometheus / pr0t31n consumers.")
+    parser.add_argument("--client-short",    metavar="SLUG", default="",
+                        help="Client short identifier for meta.json (used with --output-dir).")
+    parser.add_argument("--client-name",     metavar="NAME", default="",
+                        help="Client full name for meta.json (used with --output-dir).")
+    parser.add_argument("--engagement-name", metavar="NAME", default="",
+                        help="Engagement name for meta.json (used with --output-dir).")
     args = parser.parse_args()
 
     raw_url = args.url.rstrip("/")
@@ -3150,6 +3159,157 @@ def main():
         print(f"\n{dim('─' * 60)}")
         print(f"  {dim('AuthProbe v' + VERSION + ' complete')}")
         print()
+
+    # ── Universal output dir (schema 1.0) ─────────────────────────────────
+    if args.output_dir:
+        _write_universal_output(args.output_dir, full_url, findings, args)
+
+
+def _write_universal_output(out_dir_str: str, target_url: str,
+                            findings: dict, args) -> None:
+    """Write meta.json + findings.json + summary.json (schema 1.0) to out_dir.
+    Graceful no-op when /opt/pr0t31n/shared/pr0t31n_schema.py is not present."""
+    from pathlib import Path
+    try:
+        import sys as _s
+        if "/opt/pr0t31n/shared" not in _s.path:
+            _s.path.insert(0, "/opt/pr0t31n/shared")
+        import pr0t31n_schema as _us
+    except ImportError:
+        print(f"  [!] --output-dir given but /opt/pr0t31n/shared/pr0t31n_schema.py "
+              f"not installed — skipping universal output.")
+        return
+
+    out_dir = Path(out_dir_str).resolve()
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        _us.init_run_dir(out_dir)
+
+        # meta.json
+        _us.write_meta(out_dir, _us.make_meta(
+            tool="authprobe", version=VERSION,
+            client_short=args.client_short or "",
+            client_name=args.client_name or args.client_short or "",
+            engagement_name=args.engagement_name or f"authprobe {target_url}",
+            target=target_url,
+        ), legacy_filename=None)
+
+        # findings.json — one finding per discrete observation, plus a
+        # discovery-summary INFO finding holding the full JSON output.
+        unified_findings = _authprobe_findings_to_universal(findings, target_url)
+        (out_dir / "findings.json").write_text(
+            json.dumps(unified_findings, indent=2), encoding="utf-8"
+        )
+
+        # summary.json
+        risk_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+        for f in unified_findings:
+            r = (f.get("risk") or "INFO").upper()
+            if r in risk_counts:
+                risk_counts[r] += 1
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _us.write_summary(out_dir, _us.make_summary(
+            tool="authprobe", version=VERSION,
+            scan_start=now_iso, scan_end=now_iso,
+            target=target_url, success=True,
+            total_findings=len(unified_findings),
+            risk_counts=risk_counts,
+        ))
+        print(f"\n  {dim('Universal output:')} {cyan(str(out_dir))}")
+        print(f"  {dim('  meta.json, findings.json (' + str(len(unified_findings)) + '), summary.json')}")
+    except Exception as e:
+        print(f"  [!] --output-dir write failed: {e}")
+
+
+def _authprobe_findings_to_universal(findings: dict, target_url: str) -> list:
+    """Convert AuthProbe's discovery dict into universal-schema finding entries."""
+    try:
+        from urllib.parse import urlparse as _urlparse
+        parsed = _urlparse(target_url)
+        host = parsed.hostname or target_url
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except Exception:
+        host, port = target_url, 0
+
+    out = []
+
+    # 1. Discovery summary — always emitted, INFO level, contains full JSON.
+    out.append({
+        "id":          "",
+        "tool":        "authprobe",
+        "title":       f"AuthProbe Discovery: {host}",
+        "datetime":    "",
+        "ip":          host, "port": port, "hostname": host,
+        "risk":        "INFO",
+        "scope":       None, "phase": "", "catalogue_id": "",
+        "command":     f"authprobe.py --url {target_url}",
+        "description": ("Authentication and security-header discovery output. "
+                        "AuthProbe identifies auth methods, software, and security "
+                        "headers on the target. See 'output' for full JSON."),
+        "output":      json.dumps(findings, indent=2)[:8192],
+        "output_file": "", "cves": "",
+        "sources":     "authprobe",
+        "service":     "https" if port == 443 else "http",
+        "affected":    target_url,
+        "owasp":       "", "owasp_url": "", "nist": "",
+        "remediation": ("Review discovered authentication mechanisms for weaknesses "
+                        "(missing MFA, basic auth, deprecated mechanisms)."),
+        "exploitdb":   False, "metasploit": False, "exploit_details": [],
+    })
+
+    # 2. Missing/weak security headers — one LOW finding per missing header.
+    sec_headers = findings.get("security_headers") or {}
+    EXPECTED = ["Strict-Transport-Security", "Content-Security-Policy",
+                "X-Frame-Options", "X-Content-Type-Options", "Referrer-Policy"]
+    for header in EXPECTED:
+        if not sec_headers.get(header):
+            out.append({
+                "id": "", "tool": "authprobe",
+                "title":       f"Missing Security Header: {header}",
+                "datetime":    "",
+                "ip": host, "port": port, "hostname": host,
+                "risk": "LOW",
+                "scope": None, "phase": "", "catalogue_id": "",
+                "command":     f"authprobe.py --url {target_url}",
+                "description": f"Response is missing the '{header}' security header, "
+                               f"which mitigates a well-known attack class.",
+                "output":      f"Headers seen: {', '.join(sec_headers.keys()) or '(none)'}",
+                "output_file": "", "cves": "",
+                "sources":     "authprobe",
+                "service":     "https" if port == 443 else "http",
+                "affected":    target_url,
+                "owasp":       "A05:2021", "owasp_url": "",
+                "nist":        "",
+                "remediation": f"Add the '{header}' response header to all HTTP responses.",
+                "exploitdb":   False, "metasploit": False, "exploit_details": [],
+            })
+
+    # 3. Basic Auth detected — MEDIUM (credentials over wire in base64).
+    if findings.get("basic_auth"):
+        out.append({
+            "id": "", "tool": "authprobe",
+            "title":       "HTTP Basic Authentication in Use",
+            "datetime":    "",
+            "ip": host, "port": port, "hostname": host,
+            "risk": "MEDIUM",
+            "scope": None, "phase": "", "catalogue_id": "",
+            "command":     f"authprobe.py --url {target_url}",
+            "description": "Server presents HTTP Basic auth. Credentials are sent "
+                           "base64-encoded with every request — trivially decoded.",
+            "output":      json.dumps(findings.get("basic_auth"), indent=2),
+            "output_file": "", "cves": "",
+            "sources":     "authprobe",
+            "service":     "https" if port == 443 else "http",
+            "affected":    target_url,
+            "owasp":       "A07:2021", "owasp_url": "",
+            "nist":        "",
+            "remediation": "Replace Basic auth with token-based authentication "
+                           "(OAuth2, JWT) or session-cookie + MFA.",
+            "exploitdb":   False, "metasploit": False, "exploit_details": [],
+        })
+
+    return out
 
 
 if __name__ == "__main__":
