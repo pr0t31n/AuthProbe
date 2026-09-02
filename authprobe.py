@@ -23,9 +23,10 @@ import json
 import re
 import sys
 import warnings
+from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
-VERSION = "2.12.0"
+VERSION = "2.12.1"
 
 # Suppress SSL warnings for testing
 warnings.filterwarnings("ignore")
@@ -3169,7 +3170,6 @@ def _write_universal_output(out_dir_str: str, target_url: str,
                             findings: dict, args) -> None:
     """Write meta.json + findings.json + summary.json (schema 1.0) to out_dir.
     Graceful no-op when /opt/pr0t31n/shared/pr0t31n_schema.py is not present."""
-    from pathlib import Path
     try:
         import sys as _s
         if "/opt/pr0t31n/shared" not in _s.path:
