@@ -26,7 +26,7 @@ import warnings
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
-VERSION = "2.12.1"
+VERSION = "2.12.2"
 
 # Suppress SSL warnings for testing
 warnings.filterwarnings("ignore")
