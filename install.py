@@ -5,6 +5,18 @@ AuthProbe installer — checks Python version and installs dependencies.
 import subprocess
 import sys
 
+
+def _pip_installed(pkg_spec):
+    """Return True if a pip package is already importable."""
+    import importlib.util
+    name = pkg_spec.split(">=")[0].split("==")[0].split("[")[0].split("<")[0].strip()
+    _IMPORT_MAP = {
+        "requests-ntlm": "requests_ntlm", "requests-kerberos": "requests_kerberos",
+    }
+    mod = _IMPORT_MAP.get(name, name.replace("-", "_"))
+    return importlib.util.find_spec(mod) is not None
+
+
 REQUIREMENTS = [
     "requests>=2.28.0",
     "requests-ntlm>=1.2.0",
@@ -30,7 +42,14 @@ def main():
     print()
 
     failed = []
+    _to_install = []
     for pkg in REQUIREMENTS:
+        if _pip_installed(pkg):
+            print(f"  ✓ {pkg} already installed")
+        else:
+            _to_install.append(pkg)
+
+    for pkg in _to_install:
         print(f"  Installing {pkg}…")
         try:
             subprocess.check_call(
@@ -43,6 +62,9 @@ def main():
         except subprocess.CalledProcessError:
             print(f"  ✗ {pkg} — FAILED")
             failed.append(pkg)
+
+    if not _to_install and not failed:
+        print("  All pip packages already installed.")
 
     if failed:
         print()
