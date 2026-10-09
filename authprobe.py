@@ -28,6 +28,16 @@ from urllib.parse import urljoin, urlparse
 
 VERSION = Path(__file__).resolve().parent.joinpath("VERSION").read_text().strip()
 
+try:
+    import os as _os_pp
+    import sys as _sys_pp
+    if "/opt/pr0t31n/shared" not in _sys_pp.path:
+        _sys_pp.path.insert(0, "/opt/pr0t31n/shared")
+    import pr0t31n_pause as _pp
+except ImportError:
+    _pp = None
+_PAUSE = None
+
 # Suppress SSL warnings for testing
 warnings.filterwarnings("ignore")
 
@@ -2622,6 +2632,14 @@ def main():
                         help="Engagement name for meta.json (used with --output-dir).")
     args = parser.parse_args()
 
+    global _PAUSE
+    if _pp is not None and args.output_dir:
+        import os
+        _PAUSE = _pp.PauseManager(args.output_dir, "authprobe")
+        _PAUSE.start_watcher(grace_period=60)
+        _resumed = os.environ.get("CRUCIBLE_RESUME") == "1"
+        _PAUSE.log_run_type(resumed=_resumed)
+
     raw_url = args.url.rstrip("/")
     parsed  = urlparse(raw_url)
     if not parsed.scheme:
@@ -3160,6 +3178,9 @@ def main():
         print(f"\n{dim('─' * 60)}")
         print(f"  {dim('AuthProbe v' + VERSION + ' complete')}")
         print()
+
+    if _PAUSE:
+        _PAUSE.write_stop_reason("completed", "probe_finished")
 
     # ── Universal output dir (schema 1.0) ─────────────────────────────────
     if args.output_dir:
