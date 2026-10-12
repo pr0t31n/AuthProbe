@@ -20,9 +20,12 @@ CLI::
 
 import argparse
 import json
+import os
 import re
 import sys
+import threading
 import warnings
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -37,6 +40,58 @@ try:
 except ImportError:
     _pp = None
 _PAUSE = None
+
+# ─────────────────────────────────────────────────────────────
+# Console — protocol-aware logging for Crucible v2
+# ─────────────────────────────────────────────────────────────
+_CRUCIBLE_MANAGED = os.environ.get("CRUCIBLE_MANAGED", "") == "1"
+_PRINT_LOCK = threading.Lock()
+
+
+class AuthProbeConsole:
+    def __init__(self):
+        self._managed = _CRUCIBLE_MANAGED
+
+    def log(self, message, level="INFO"):
+        with _PRINT_LOCK:
+            if self._managed:
+                entry = {"ts": datetime.now().isoformat(), "level": level, "message": message}
+                sys.stdout.write("__CRUCIBLE_LOG__:" + json.dumps(entry) + "\n")
+                sys.stdout.flush()
+            else:
+                ts = datetime.now().strftime("%H:%M:%S")
+                colors = {"INFO": "\033[36m", "SUCCESS": "\033[32m",
+                          "WARNING": "\033[33m", "ERROR": "\033[31m"}
+                tags = {"INFO": "[*]", "SUCCESS": "[+]", "WARNING": "[~]", "ERROR": "[!]"}
+                c = colors.get(level, "")
+                tag = tags.get(level, "[*]")
+                reset = "\033[0m"
+                print(f"[{ts}] {c}{tag}{reset} {message}")
+
+    def error(self, message, source="authprobe"):
+        with _PRINT_LOCK:
+            if self._managed:
+                entry = {"ts": datetime.now().isoformat(), "source": source, "message": message}
+                sys.stderr.write("__CRUCIBLE_ERR__:" + json.dumps(entry) + "\n")
+                sys.stderr.flush()
+            else:
+                ts = datetime.now().strftime("%H:%M:%S")
+                print(f"[{ts}] \033[31m[!]\033[0m {message}")
+
+    def status(self, phase, label="", status="running", step="", progress=0, total=0):
+        with _PRINT_LOCK:
+            if self._managed:
+                entry = {"phase": phase, "label": label, "status": status, "step": step,
+                         "progress": progress, "total": total, "ts": datetime.now().isoformat()}
+                sys.stdout.write("__CRUCIBLE_STATUS__:" + json.dumps(entry) + "\n")
+                sys.stdout.flush()
+            else:
+                ts = datetime.now().strftime("%H:%M:%S")
+                if step:
+                    print(f"[{ts}] \033[36m[*]\033[0m [{label}] {step}")
+
+
+_console = AuthProbeConsole()
 
 # Suppress SSL warnings for testing
 warnings.filterwarnings("ignore")
@@ -839,7 +894,7 @@ def _make_session(args):
         import requests
         from requests.adapters import HTTPAdapter
     except ImportError:
-        print(red("ERROR: requests library not installed. Run: pip install requests"))
+        _console.error("requests library not installed. Run: pip install requests")
         sys.exit(1)
     sess = requests.Session()
     sess.verify = False
@@ -1253,6 +1308,7 @@ def fingerprint_rendered(
 
     Returns {"error": "..."} immediately when Selenium is not installed.
     """
+    _console.log(f"[rendered] Starting headless Chrome render of {url}...", "INFO")
     result: dict = {
         "title":            "",
         "visible_text":     "",
@@ -1389,6 +1445,7 @@ def fingerprint_rendered(
 
 def probe_well_known(sess, base_url: str, timeout: int) -> dict:
     """Probe well-known spec/discovery endpoints from origin root."""
+    _console.log(f"[well-known] Probing {len(_WELL_KNOWN_ENDPOINTS)} spec endpoints...", "INFO")
     parsed = urlparse(base_url)
     port_part = f":{parsed.port}" if parsed.port and parsed.port not in (80, 443) else ""
     origin = f"{parsed.scheme}://{parsed.hostname}{port_part}"
@@ -1658,6 +1715,7 @@ def detect_oauth_discovery(sess, origin: str, timeout: int, findings: dict):
 def detect_login_endpoints(sess, origin: str, timeout: int, probe_type: str,
                            skip_paths: set, findings: dict):
     """Probe common login paths from the API origin root."""
+    _console.log(f"[login-discovery] Probing {len(_LOGIN_PROBE_PATHS)} common login paths against {origin}...", "INFO")
     found = []
     for path in _LOGIN_PROBE_PATHS:
         if path.rstrip("/") in skip_paths:
@@ -1684,10 +1742,13 @@ def detect_login_endpoints(sess, origin: str, timeout: int, probe_type: str,
             if probe_type == "webapp":
                 detect_form_login(r, findings)
     if found:
+        _console.log(f"[login-discovery] Found {len(found)} login endpoint(s)", "SUCCESS")
         existing = {ep["path"] for ep in findings.get("login_endpoints", [])}
         for ep in found:
             if ep["path"] not in existing:
                 findings["login_endpoints"].append(ep)
+    else:
+        _console.log("[login-discovery] No additional login endpoints found", "INFO")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1743,6 +1804,7 @@ def validate_apikey_header(sess, url: str, api_key: str,
 def validate_token_login(sess, login_url: str, username: str, password: str,
                          timeout: int) -> dict:
     """POST JSON credentials to a login endpoint; check for token in response."""
+    _console.log(f"[validate] Testing token login against {login_url}...", "INFO")
     best: dict = {"method": "token_login", "success": False,
                   "status": None, "evidence": ""}
 
@@ -1845,6 +1907,607 @@ def validate_form_login(sess, login_url: str, username: str, password: str,
                         "status": r.status_code, "evidence": "logout/welcome text found"}
     return {"method": "form_login", "success": False,
             "status": r.status_code if r else None}
+
+
+# ─────────────────────────────────────────────────────────────
+# Session builder — feature parity with testConnection.py
+# ─────────────────────────────────────────────────────────────
+
+AUTH_METHODS: dict = {
+    "form_login":           "Form Login — POST credentials → session cookies",
+    "basic":                "HTTP Basic Auth (Authorization: Basic …)",
+    "digest":               "HTTP Digest Auth (challenge-response)",
+    "ntlm":                 "NTLM / Windows Integrated Auth (Active Directory)",
+    "ntlm_v2":              "NTLMv2 + Channel Binding Token (EPA)",
+    "bearer":               "Bearer Token (Authorization: Bearer …)",
+    "session_cookie":       "Session Cookie — pre-captured cookie string",
+    "token_login":          "Token Login — POST credentials → JSON token → Bearer header",
+    "oauth2_client_creds":  "OAuth2 Client Credentials (machine-to-machine, RFC 6749 §4.4)",
+    "oauth1a":              "OAuth 1.0a — HMAC-SHA1 signed request",
+    "saml_assertion":       "SAML 2.0 — POST pre-captured SAMLResponse to ACS URL",
+    "oidc_token":           "OIDC — pre-obtained id_token as Bearer",
+    "mtls":                 "mTLS — mutual TLS with client certificate",
+    "totp_mfa":             "TOTP/HOTP MFA — form login + TOTP second factor",
+    "webauthn_probe":       "WebAuthn/FIDO2 — probe server for support (detection only)",
+    "apikey_header":        "API Key in Header (custom header name)",
+    "apikey_cookie":        "API Key / Token in Cookie",
+    "header_creds":         "Custom Credential Headers (static key-value pairs)",
+    "kerberos":             "Kerberos / SPNEGO Negotiate",
+    "kerberos_delegation":  "Kerberos S4U2Proxy — constrained delegation",
+    "proxy_header":         "Proxy / Gateway Auth Header",
+    "auto":                 "Auto-detect — probe target + JS source mining + heuristics",
+}
+
+
+def _csrf_prefetch_ap(sess, login_url: str, timeout: int):
+    """GET login_url; return (form_action_url, hidden_input_fields)."""
+    try:
+        r = sess.get(login_url, timeout=timeout)
+        html = r.text
+    except Exception:
+        return "", {}
+    hidden = {}
+    form_action = ""
+    for form_m in re.finditer(r"(?s)<form[^>]*>(.+?)</form>", html, re.IGNORECASE):
+        form_tag = form_m.group(0)
+        form_body = form_m.group(1)
+        if not re.search(r'<input[^>]+type=["\']?password["\']?', form_body, re.I):
+            continue
+        act_m = re.search(r'\baction=["\']([^"\']*)["\']', form_tag, re.I)
+        if act_m:
+            raw = act_m.group(1).strip()
+            if raw:
+                form_action = urljoin(login_url, raw)
+        for inp in re.finditer(r"<input[^>]+>", form_body, re.I):
+            tag = inp.group(0)
+            t_m = re.search(r'\btype=["\']?(\w+)["\']?', tag, re.I)
+            if not t_m or t_m.group(1).lower() != "hidden":
+                continue
+            n_m = re.search(r'\bname=["\']([^"\']+)["\']', tag, re.I)
+            v_m = re.search(r'\bvalue=["\']([^"\']*)["\']', tag, re.I)
+            if n_m:
+                hidden[n_m.group(1)] = v_m.group(1) if v_m else ""
+        break
+    return form_action, hidden
+
+
+def _login_post_ap(sess, auth: dict, timeout: int, allow_redirects: bool = True):
+    """CSRF prefetch + POST credentials. Returns (response_or_None, post_url)."""
+    url = auth.get("login_url", "")
+    if not url:
+        return None, ""
+    login_mode = auth.get("login_mode", "fields")
+    uf = auth.get("login_username_field", "username")
+    pf = auth.get("login_password_field", "password")
+    u = auth.get("username", "")
+    p = auth.get("password", "")
+    form_action, hidden = _csrf_prefetch_ap(sess, url, timeout)
+    post_url = form_action if form_action else url
+    if login_mode == "fields":
+        data = dict(hidden)
+        if u:
+            data[uf] = u
+        if p:
+            data[pf] = p
+    elif login_mode == "json":
+        raw = auth.get("login_data", "{}")
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        except Exception:
+            data = {}
+    else:
+        raw = auth.get("login_data", "{}")
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        except Exception:
+            data = {}
+        if u and uf not in data:
+            data[uf] = u
+        if p and pf not in data:
+            data[pf] = p
+        for k, v in hidden.items():
+            if k not in data:
+                data[k] = v
+    ct = auth.get("login_content_type", "application/json")
+    try:
+        if "json" in ct:
+            return sess.post(post_url, json=data, timeout=timeout,
+                             allow_redirects=allow_redirects), post_url
+        return sess.post(post_url, data=data, timeout=timeout,
+                         allow_redirects=allow_redirects), post_url
+    except Exception:
+        return None, post_url
+
+
+def _make_session_bs(proxy: str = "", timeout: int = 10, verify_ssl: bool = False):
+    """Create a requests.Session with retry adapter for build_auth_session."""
+    try:
+        import requests as _req
+        from requests.adapters import HTTPAdapter
+        try:
+            from urllib3.util.retry import Retry
+        except ImportError:
+            from requests.packages.urllib3.util.retry import Retry
+    except ImportError:
+        return None
+    sess = _req.Session()
+    retry = Retry(total=2, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
+    sess.mount("http://", HTTPAdapter(max_retries=retry))
+    sess.mount("https://", HTTPAdapter(max_retries=retry))
+    sess.verify = verify_ssl
+    if proxy:
+        sess.proxies = {"http": proxy, "https": proxy}
+    sess.headers["User-Agent"] = f"AuthProbe/{VERSION}"
+    return sess
+
+
+def build_auth_session(
+    auth: dict,
+    timeout: int = 10,
+    proxy: str = "",
+    verify_ssl: bool = False,
+):
+    """
+    Construct an authenticated requests.Session for the given auth config.
+    Returns (session, info_message). info_message starts with "ERROR:" on failure.
+    """
+    _console.log("build_auth_session() starting", "INFO")
+    sess = _make_session_bs(proxy, timeout, verify_ssl)
+    if sess is None:
+        _console.error("requests library not available")
+        return None, "ERROR: requests library not available"
+    method = (auth.get("method") or auth.get("auth_method")
+              or auth.get("auth_type") or "form_login").strip().lower()
+    _console.log(f"Auth method: {method}", "INFO")
+
+    if method == "form_login":
+        login_url = auth.get("login_url", "")
+        if not login_url:
+            return sess, "ERROR: login_url is required for form_login"
+        resp, post_url = _login_post_ap(sess, auth, timeout)
+        if resp is None:
+            return sess, f"ERROR: POST to {post_url or login_url} failed (network/timeout)"
+        if not resp.ok:
+            if resp.status_code == 405:
+                return sess, (
+                    f"ERROR: POST {post_url} → HTTP 405 Method Not Allowed — "
+                    "check the HTML form action attribute")
+            return sess, (
+                f"ERROR: POST {post_url} → HTTP {resp.status_code} — "
+                "login rejected (check credentials and login URL)")
+        n = len(sess.cookies)
+        sc = resp.status_code
+        if n == 0:
+            return sess, (
+                f"WARNING: POST {post_url} → HTTP {sc} — "
+                "login accepted but no session cookies returned")
+        _console.log(f"form_login: {n} cookie(s) from {post_url}", "SUCCESS")
+        return sess, f"POST {post_url} → HTTP {sc}, {n} cookie(s) stored"
+
+    elif method == "basic":
+        user = auth.get("username", "")
+        pw = auth.get("password", "")
+        if not user:
+            return sess, "WARNING: no username provided for HTTP Basic"
+        sess.auth = (user, pw)
+        return sess, f"HTTP Basic: user={user}"
+
+    elif method == "digest":
+        try:
+            from requests.auth import HTTPDigestAuth
+        except ImportError:
+            return sess, "ERROR: requests library required for digest auth"
+        user = auth.get("username", "")
+        pw = auth.get("password", "")
+        if not user:
+            return sess, "WARNING: no username provided for HTTP Digest"
+        sess.auth = HTTPDigestAuth(user, pw)
+        return sess, f"HTTP Digest: user={user}"
+
+    elif method == "ntlm":
+        user = auth.get("username", "")
+        pw = auth.get("password", "")
+        domain = auth.get("domain", "")
+        if not user:
+            return sess, "ERROR: username is required for NTLM"
+        try:
+            from requests_ntlm import HttpNtlmAuth
+        except ImportError:
+            return sess, "ERROR: NTLM auth requires: pip install requests-ntlm"
+        domain = domain.rstrip("\\").strip()
+        ntlm_user = f"{domain}\\{user}" if domain else user
+        sess.auth = HttpNtlmAuth(ntlm_user, pw)
+        return sess, f"NTLM: {ntlm_user}"
+
+    elif method == "ntlm_v2":
+        user = auth.get("username", "")
+        pw = auth.get("password", "")
+        domain = auth.get("domain", "").rstrip("\\").strip()
+        if not user:
+            return sess, "ERROR: username is required for ntlm_v2"
+        try:
+            from requests_ntlm import HttpNtlmAuth
+        except ImportError:
+            return sess, "ERROR: NTLMv2 requires: pip install requests-ntlm"
+        ntlm_user = f"{domain}\\{user}" if domain else user
+        try:
+            sess.auth = HttpNtlmAuth(ntlm_user, pw, send_cbt=True)
+        except TypeError:
+            sess.auth = HttpNtlmAuth(ntlm_user, pw)
+            return sess, f"NTLMv2 (send_cbt not supported): {ntlm_user}"
+        return sess, f"NTLMv2 + channel binding: {ntlm_user}"
+
+    elif method == "bearer":
+        token = auth.get("auth_token", auth.get("token", "")).strip()
+        if not token:
+            return sess, "WARNING: no token provided for Bearer auth"
+        tt = auth.get("token_type", "Bearer").strip()
+        sess.headers["Authorization"] = f"{tt} {token}"
+        return sess, f"Authorization: {tt} ***"
+
+    elif method == "session_cookie":
+        raw = auth.get("session_cookie", "").strip()
+        if not raw:
+            return sess, "WARNING: no session_cookie value provided"
+        names = []
+        for part in raw.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" in part:
+                k, _, v = part.partition("=")
+                sess.cookies.set(k.strip(), v.strip())
+                names.append(k.strip())
+            else:
+                sess.cookies.set(part, "")
+                names.append(part)
+        return sess, f"Session cookie(s) set: {', '.join(names)}"
+
+    elif method == "token_login":
+        login_url = auth.get("login_url", "")
+        if not login_url:
+            return sess, "ERROR: login_url is required for token_login"
+        resp, post_url = _login_post_ap(sess, auth, timeout)
+        if resp is None:
+            return sess, f"ERROR: POST to {post_url or login_url} failed (network/timeout)"
+        if not resp.ok:
+            return sess, (
+                f"ERROR: POST {post_url} → HTTP {resp.status_code} — "
+                "login rejected (check credentials and login URL)")
+        try:
+            body = resp.json()
+        except Exception:
+            return sess, (
+                f"ERROR: POST {post_url} → HTTP {resp.status_code} — "
+                "response is not JSON; cannot extract token")
+        token_path = auth.get("login_token_path", "token")
+        token = body
+        for part in token_path.split("."):
+            token = token.get(part) if isinstance(token, dict) else None
+        if not token or not isinstance(token, str):
+            for k in ("token", "access_token", "jwt", "id_token", "auth_token"):
+                if k in body:
+                    token = body[k]
+                    break
+        if token is not None and token != "":
+            token = str(token)
+            tt = auth.get("token_type", "Bearer").strip()
+            sess.headers["Authorization"] = f"{tt} {token}"
+            _console.log(f"token_login: token extracted via path='{token_path}'", "SUCCESS")
+            return sess, (
+                f"POST {post_url} → HTTP {resp.status_code}; "
+                f"token extracted via path='{token_path}'")
+        return sess, (
+            f"ERROR: POST {post_url} → HTTP {resp.status_code}; "
+            f"no token found at path='{token_path}'")
+
+    elif method == "oauth2_client_creds":
+        token_url = auth.get("oauth_token_url", "")
+        client_id = auth.get("oauth_client_id", "")
+        client_secret = auth.get("oauth_client_secret", "")
+        scope = auth.get("oauth_scope", "")
+        if not token_url:
+            return sess, "ERROR: oauth_token_url is required"
+        if not client_id:
+            return sess, "ERROR: oauth_client_id is required"
+        client_auth_method = auth.get("client_auth_method", "body").strip().lower()
+        data = {"grant_type": "client_credentials"}
+        req_kwargs = {"timeout": timeout}
+        if client_auth_method == "basic":
+            req_kwargs["auth"] = (client_id, client_secret)
+        else:
+            data["client_id"] = client_id
+            data["client_secret"] = client_secret
+        if scope:
+            data["scope"] = scope
+        try:
+            resp = sess.post(token_url, data=data, **req_kwargs)
+        except Exception as exc:
+            return sess, f"ERROR: OAuth2 token request failed: {exc}"
+        if not resp.ok:
+            return sess, (
+                f"ERROR: OAuth2 POST {token_url} → HTTP {resp.status_code} — "
+                "token request rejected")
+        try:
+            body = resp.json()
+        except Exception:
+            return sess, (
+                f"ERROR: OAuth2 POST {token_url} → HTTP {resp.status_code} — "
+                "response is not JSON")
+        access_token = body.get("access_token", "")
+        if not access_token:
+            return sess, (
+                f"ERROR: OAuth2 POST {token_url} → HTTP {resp.status_code}; "
+                "no access_token in response")
+        tt = body.get("token_type", "Bearer")
+        sess.headers["Authorization"] = f"{tt} {access_token}"
+        _console.log(f"OAuth2 token obtained from {token_url}", "SUCCESS")
+        return sess, f"OAuth2 token obtained from {token_url} → HTTP {resp.status_code}"
+
+    elif method == "oauth1a":
+        consumer_key = auth.get("oauth1_consumer_key", "").strip()
+        consumer_secret = auth.get("oauth1_consumer_secret", "").strip()
+        access_token = auth.get("oauth1_access_token", "").strip()
+        token_secret = auth.get("oauth1_token_secret", "").strip()
+        if not consumer_key:
+            return sess, "ERROR: oauth1_consumer_key is required for oauth1a"
+        try:
+            from requests_oauthlib import OAuth1
+        except ImportError:
+            return sess, "ERROR: OAuth 1.0a requires: pip install requests-oauthlib"
+        sess.auth = OAuth1(consumer_key, consumer_secret,
+                           access_token or None, token_secret or None)
+        return sess, f"OAuth 1.0a configured (consumer={consumer_key})"
+
+    elif method == "saml_assertion":
+        acs_url = auth.get("saml_acs_url", "").strip()
+        assertion = auth.get("saml_assertion", "").strip()
+        relay_state = auth.get("saml_relay_state", "")
+        if not acs_url:
+            return sess, "ERROR: saml_acs_url is required for saml_assertion"
+        if not assertion:
+            return sess, "ERROR: saml_assertion (base64-encoded SAMLResponse) is required"
+        try:
+            data = {"SAMLResponse": assertion}
+            if relay_state:
+                data["RelayState"] = relay_state
+            resp = sess.post(acs_url, data=data, timeout=timeout, allow_redirects=True)
+            if resp.status_code in (401, 403):
+                return sess, (
+                    f"ERROR: SAML POST to {acs_url} → HTTP {resp.status_code} — "
+                    "assertion rejected")
+            return sess, f"SAML assertion posted to {acs_url} → HTTP {resp.status_code}"
+        except Exception as exc:
+            return sess, f"ERROR: SAML POST failed: {exc}"
+
+    elif method == "oidc_token":
+        id_token = auth.get("oidc_id_token", "").strip()
+        userinfo = auth.get("oidc_userinfo_url", "").strip()
+        if not id_token:
+            return sess, "ERROR: oidc_id_token is required for oidc_token"
+        sess.headers["Authorization"] = f"Bearer {id_token}"
+        if not userinfo:
+            return sess, "OIDC id_token set as Bearer (no userinfo_url provided)"
+        try:
+            r = sess.get(userinfo, timeout=timeout)
+            if r.status_code == 401:
+                return sess, f"ERROR: OIDC userinfo {userinfo} → HTTP 401 — token rejected"
+            return sess, f"OIDC id_token valid — userinfo {userinfo} → HTTP {r.status_code}"
+        except Exception as exc:
+            return sess, f"OIDC id_token set; userinfo probe failed: {exc}"
+
+    elif method == "mtls":
+        cert_path = auth.get("mtls_cert", "").strip()
+        key_path = auth.get("mtls_key", "").strip()
+        ca_bundle = auth.get("mtls_ca_bundle", "").strip()
+        if not cert_path:
+            return sess, "ERROR: mtls_cert (path to PEM certificate) is required"
+        if not key_path:
+            return sess, "ERROR: mtls_key (path to PEM private key) is required"
+        if not os.path.isfile(cert_path):
+            return sess, f"ERROR: mtls_cert file not found: {cert_path}"
+        if not os.path.isfile(key_path):
+            return sess, f"ERROR: mtls_key file not found: {key_path}"
+        sess.cert = (cert_path, key_path)
+        if ca_bundle and os.path.isfile(ca_bundle):
+            sess.verify = ca_bundle
+        return sess, f"mTLS client cert configured: {cert_path}"
+
+    elif method == "totp_mfa":
+        login_url = auth.get("login_url", "")
+        mfa_url = auth.get("totp_mfa_url", "").strip()
+        totp_secret = auth.get("totp_secret", "").strip()
+        mfa_field = auth.get("totp_field", "otp")
+        if not login_url:
+            return sess, "ERROR: login_url is required for totp_mfa"
+        resp, post_url = _login_post_ap(sess, auth, timeout)
+        if resp is None:
+            return sess, f"ERROR: POST to {post_url or login_url} failed (network/timeout)"
+        if not resp.ok:
+            if resp.status_code == 405:
+                return sess, (
+                    f"ERROR: POST {post_url} → HTTP 405 Method Not Allowed — "
+                    "check the HTML form action attribute")
+            return sess, (
+                f"ERROR: POST {post_url} → HTTP {resp.status_code} — "
+                "primary login rejected")
+        if not mfa_url:
+            return sess, (
+                f"POST {post_url} → HTTP {resp.status_code} (primary OK); "
+                "no totp_mfa_url provided — skipping MFA step")
+        if not totp_secret:
+            return sess, (
+                f"POST {post_url} → HTTP {resp.status_code} (primary OK); "
+                "no totp_secret provided — cannot generate OTP")
+        try:
+            import hmac as _hmac
+            import hashlib as _hl
+            import struct as _struct
+            import time as _time
+            import base64 as _b64
+            def _totp(secret, digits=6, period=30):
+                key = _b64.b32decode(secret.upper().replace(" ", ""))
+                t = int(_time.time()) // period
+                msg = _struct.pack(">Q", t)
+                h = _hmac.new(key, msg, _hl.sha1).digest()
+                off = h[-1] & 0x0F
+                code = (_struct.unpack(">I", h[off:off+4])[0] & 0x7FFFFFFF) % (10 ** digits)
+                return str(code).zfill(digits)
+            otp = _totp(totp_secret)
+            mfa_resp = sess.post(mfa_url, data={mfa_field: otp}, timeout=timeout)
+            if not mfa_resp.ok:
+                return sess, (
+                    f"ERROR: MFA POST {mfa_url} → HTTP {mfa_resp.status_code} — "
+                    "second factor rejected")
+            _console.log(f"TOTP MFA accepted at {mfa_url}", "SUCCESS")
+            return sess, (
+                f"POST {post_url} → HTTP {resp.status_code}; "
+                f"MFA POST {mfa_url} → HTTP {mfa_resp.status_code} (OTP accepted)")
+        except Exception as exc:
+            return sess, f"ERROR: TOTP MFA step failed: {exc}"
+
+    elif method == "webauthn_probe":
+        probe_url = auth.get("webauthn_probe_url", "").strip()
+        try:
+            r = sess.get(probe_url, timeout=timeout) if probe_url else None
+        except Exception:
+            r = None
+        indicators = []
+        if r is not None:
+            body = r.text
+            if "webauthn" in body.lower() or "fido" in body.lower():
+                indicators.append("WebAuthn/FIDO keywords in page body")
+            if "/.well-known/webauthn" in body or "PublicKeyCredential" in body:
+                indicators.append("WebAuthn API reference detected")
+        if indicators:
+            return sess, f"WebAuthn support detected: {'; '.join(indicators)}"
+        return sess, "WebAuthn probe complete — no indicators found"
+
+    elif method == "apikey_header":
+        key = auth.get("api_key", "").strip()
+        header = auth.get("api_key_header", "X-API-Key")
+        if not key:
+            return sess, "WARNING: no api_key provided for apikey_header"
+        sess.headers[header] = key
+        return sess, f"{header}: ***"
+
+    elif method == "apikey_cookie":
+        key = auth.get("api_key", "").strip()
+        cookie_name = auth.get("api_key_cookie", "api_key")
+        if not key:
+            return sess, "WARNING: no api_key provided for apikey_cookie"
+        sess.cookies.set(cookie_name, key)
+        return sess, f"Cookie {cookie_name}=***"
+
+    elif method == "header_creds":
+        hdrs = auth.get("custom_headers", {})
+        if not isinstance(hdrs, dict) or not hdrs:
+            return sess, "WARNING: no custom_headers provided"
+        sess.headers.update(hdrs)
+        names = list(hdrs.keys())
+        return sess, f"Set {len(names)} header(s): {', '.join(names)}"
+
+    elif method == "kerberos":
+        try:
+            from requests_kerberos import HTTPKerberosAuth, OPTIONAL
+        except ImportError:
+            return sess, "ERROR: Kerberos auth requires: pip install requests-kerberos"
+        sess.auth = HTTPKerberosAuth(mutual_authentication=OPTIONAL)
+        return sess, "Kerberos SPNEGO auth configured"
+
+    elif method == "kerberos_delegation":
+        try:
+            from requests_kerberos import HTTPKerberosAuth, REQUIRED
+        except ImportError:
+            return sess, "ERROR: Kerberos delegation requires: pip install requests-kerberos"
+        impersonate = auth.get("kerberos_impersonate", "")
+        kwargs = {"mutual_authentication": REQUIRED, "delegate": True}
+        if impersonate:
+            kwargs["principal"] = impersonate
+        sess.auth = HTTPKerberosAuth(**kwargs)
+        detail = (f"Kerberos delegation configured (impersonate={impersonate})"
+                  if impersonate else "Kerberos S4U2Proxy delegation configured")
+        return sess, detail
+
+    elif method == "proxy_header":
+        hdr_name = auth.get("proxy_header_name", "X-Remote-User").strip()
+        hdr_value = auth.get("proxy_header_value", "").strip()
+        if not hdr_value:
+            return sess, f"WARNING: no proxy_header_value provided for header '{hdr_name}'"
+        sess.headers[hdr_name] = hdr_value
+        return sess, f"Proxy auth header set: {hdr_name}: {hdr_value}"
+
+    elif method == "auto":
+        _console.log("auto-detect: probing target for auth signals", "INFO")
+        target_url = auth.get("_target_url", auth.get("login_url", ""))
+        has_creds = bool(auth.get("username"))
+        if not has_creds:
+            return sess, "ERROR: auto-detect needs credentials (username/password)"
+
+        _errors = []
+        # Try HTTP-level auth first (401 + WWW-Authenticate)
+        try:
+            r = sess.get(target_url, timeout=timeout, allow_redirects=False)
+            if r.status_code == 401:
+                www = r.headers.get("WWW-Authenticate", "")
+                if "ntlm" in www.lower() or "negotiate" in www.lower():
+                    _console.log("auto-detect: NTLM/Negotiate detected", "INFO")
+                    auth["method"] = "ntlm"
+                    return build_auth_session(auth, timeout, proxy, verify_ssl)
+                if "basic" in www.lower():
+                    _console.log("auto-detect: Basic auth detected", "INFO")
+                    auth["method"] = "basic"
+                    return build_auth_session(auth, timeout, proxy, verify_ssl)
+                if "digest" in www.lower():
+                    auth["method"] = "digest"
+                    return build_auth_session(auth, timeout, proxy, verify_ssl)
+        except Exception:
+            pass
+
+        # Try form login
+        login_url = auth.get("login_url", "")
+        if not login_url:
+            _heuristic_paths = [
+                "/login", "/signin", "/sign-in", "/auth/login",
+                "/account/login", "/session/new", "/users/sign_in",
+                "/wp-login.php", "/admin/login",
+            ]
+            parsed = urlparse(target_url)
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            for p in _heuristic_paths:
+                try:
+                    r = sess.get(origin + p, timeout=timeout, allow_redirects=True)
+                    if r.status_code == 200 and re.search(
+                            r'<input[^>]+type=["\']?password', r.text, re.I):
+                        login_url = origin + p
+                        _console.log(f"auto-detect: found login form at {login_url}", "INFO")
+                        break
+                except Exception:
+                    continue
+
+        if login_url:
+            auth["login_url"] = login_url
+            auth["method"] = "form_login"
+            s, msg = build_auth_session(auth, timeout, proxy, verify_ssl)
+            if not msg.startswith("ERROR:"):
+                _console.log(f"auto-detect → form_login ({login_url})", "SUCCESS")
+                return s, f"auto-detect → form_login ({login_url}): {msg}"
+            _errors.append(f"form_login: {msg}")
+
+            # Try as token_login (JSON API)
+            auth["method"] = "token_login"
+            auth["login_content_type"] = "application/json"
+            s2, msg2 = build_auth_session(auth, timeout, proxy, verify_ssl)
+            if not msg2.startswith("ERROR:"):
+                _console.log(f"auto-detect → token_login ({login_url})", "SUCCESS")
+                return s2, f"auto-detect → token_login ({login_url}): {msg2}"
+            _errors.append(f"token_login: {msg2}")
+
+        if _errors:
+            return sess, "ERROR: auto-detect exhausted all methods — " + "; ".join(_errors)
+        return sess, "ERROR: auto-detect found no login form and no 401 challenge"
+
+    return sess, f"WARNING: unknown auth method '{method}'"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1991,6 +2654,7 @@ def _lp_match_from_index(url: str) -> "dict | None":
 # ─────────────────────────────────────────────────────────────
 
 def _print_section(title):
+    _console.log(f"━━━ {title} ━━━", "INFO")
     print(f"\n{bold(cyan('━' * 60))}")
     print(f"  {bold(title)}")
     print(f"{bold(cyan('━' * 60))}")
@@ -2256,8 +2920,10 @@ class AuthProbe:
 
     def probe(self, url: str) -> dict:
         """Probe *url* and return a structured detection result."""
+        _console.log(f"AuthProbe.probe() starting for {url}", "INFO")
         sess = _make_session_raw(proxy=self.proxy, timeout=self.timeout)
         if sess is None:
+            _console.error(f"requests library not available for {url}")
             return self._error(url, "requests library not available")
 
         findings: dict = {
@@ -2304,9 +2970,12 @@ class AuthProbe:
             probe_type = "webapp"
 
         # Phase 1: Probe primary URL
+        _console.log(f"[probe] Phase 1: Probing {full_url}...", "INFO")
         base_resp = _safe_get(sess, full_url, self.timeout)
         if base_resp is None:
+            _console.error(f"All HTTP probes to {full_url} failed (network/timeout)")
             return self._error(url, "All HTTP probes failed (network/timeout)")
+        _console.log(f"[probe] Phase 1: Target responded HTTP {base_resp.status_code}", "SUCCESS")
 
         body = ""
         try:
@@ -2315,6 +2984,7 @@ class AuthProbe:
             pass
 
         # Phase 2: Detect standard auth signals
+        _console.log("[probe] Phase 2: Detecting auth signals...", "INFO")
         detect_www_authenticate(base_resp, findings)
         detect_basic_auth(base_resp, findings)
         detect_ntlm_kerberos(base_resp, findings)
@@ -2326,10 +2996,14 @@ class AuthProbe:
         detect_security_headers(base_resp, findings)
 
         # Phase 3: Software fingerprinting (static HTML)
+        _console.log("[probe] Phase 3: Software fingerprinting...", "INFO")
         cookie_names = [c.name for c in base_resp.cookies]
         sw_matches = fingerprint_software(
             full_url, dict(base_resp.headers), body, cookie_names
         )
+
+        if sw_matches:
+            _console.log(f"[probe] Phase 3: Identified: {', '.join(sw['name'] for sw in sw_matches[:3])}", "SUCCESS")
 
         # Phase 3b: Rendered-page fingerprinting (Selenium) if enabled
         if self.rendered:
@@ -2375,7 +3049,10 @@ class AuthProbe:
         findings["software_matches"] = sw_matches
 
         # Phase 4: Well-known / spec endpoint discovery
+        _console.log("[probe] Phase 4: Probing well-known endpoints...", "INFO")
         well_known = probe_well_known(sess, full_url, self.timeout)
+        if well_known:
+            _console.log(f"[probe] Phase 4: Found: {', '.join(well_known.keys())}", "SUCCESS")
         findings["well_known"] = well_known
 
         # Phase 4b: Auth challenges from well-known probe responses
@@ -2402,13 +3079,16 @@ class AuthProbe:
                 pass
 
         # Phase 5: URL type classification
+        _console.log("[probe] Phase 5: Classifying URL type...", "INFO")
         url_type, url_type_conf = classify_url_type(
             full_url, base_resp, body, well_known, sw_matches
         )
         findings["url_type"]              = url_type
         findings["url_type_confidence"]   = url_type_conf
+        _console.log(f"[probe] Phase 5: URL type: {url_type} ({url_type_conf}%)", "SUCCESS")
 
         # Phase 6: Login endpoint discovery
+        _console.log("[probe] Phase 6: Login endpoint discovery...", "INFO")
         if given_is_login:
             findings["login_endpoints"].append({
                 "path": url_path,
@@ -2420,12 +3100,21 @@ class AuthProbe:
         detect_oauth_discovery(sess, origin, self.timeout, findings)
 
         # Phase 7: Build auth_methods list from all signals
+        _console.log("[probe] Phase 7: Building auth method confidence scores...", "INFO")
         auth_methods = self._build_auth_methods(findings, sw_matches, well_known)
 
+        if auth_methods:
+            _console.log(f"[probe] Phase 7: Top auth method: {auth_methods[0]['method']} "
+                         f"({auth_methods[0]['confidence']}% confidence)", "SUCCESS")
+
         # Phase 8: Recommendations
+        _console.log("[probe] Phase 8: Building recommendations...", "INFO")
         recommendations = [m["method"] for m in auth_methods if m["confidence"] >= 40]
         if not recommendations:
             recommendations = [m["method"] for m in auth_methods[:3]]
+
+        _console.log(f"AuthProbe.probe() complete for {full_url} — "
+                     f"{len(auth_methods)} auth method(s), {len(recommendations)} recommendation(s)", "SUCCESS")
 
         return {
             "url":                  full_url,
@@ -2582,6 +3271,8 @@ class AuthProbe:
 # ─────────────────────────────────────────────────────────────
 
 def main():
+    _console.log(f"AuthProbe v{VERSION} starting", "INFO")
+    _console.status("init", label="AuthProbe", status="running", step="Initializing")
     print(BANNER)
 
     parser = argparse.ArgumentParser(
@@ -2630,7 +3321,110 @@ def main():
                         help="Client full name for meta.json (used with --output-dir).")
     parser.add_argument("--engagement-name", metavar="NAME", default="",
                         help="Engagement name for meta.json (used with --output-dir).")
+    parser.add_argument("--build-session", action="store_true",
+                        help="Build an authenticated session and test connectivity "
+                             "(requires --auth-method and credentials)")
+    parser.add_argument("--auth-method",   metavar="METHOD", default="",
+                        help="Auth method for --build-session (e.g. form_login, basic, "
+                             "bearer, token_login, auto). Use --list-methods to see all.")
+    parser.add_argument("--login-mode",    metavar="MODE",  default="fields",
+                        choices=["fields", "json", "merge"],
+                        help="Login POST mode: fields (form-encoded, default), json, merge")
+    parser.add_argument("--login-username-field", metavar="FIELD", default="username",
+                        help="Form field name for username (default: username)")
+    parser.add_argument("--login-password-field", metavar="FIELD", default="password",
+                        help="Form field name for password (default: password)")
+    parser.add_argument("--login-token-path", metavar="PATH", default="token",
+                        help="Dot-path to extract token from JSON response (e.g. data.access_token)")
+    parser.add_argument("--login-content-type", metavar="CT", default="application/json",
+                        help="Content-Type for login POST (default: application/json)")
+    parser.add_argument("--session-cookie", metavar="COOKIES", default="",
+                        help="Pre-captured session cookie string for session_cookie method")
+    parser.add_argument("--domain",        metavar="DOMAIN", default="",
+                        help="AD domain for NTLM auth (e.g. CORP)")
+    parser.add_argument("--list-methods",  action="store_true",
+                        help="List all supported auth methods and exit")
     args = parser.parse_args()
+
+    # ── --list-methods: print all auth methods and exit ──
+    if args.list_methods:
+        print(f"\nAuthProbe v{VERSION} — Supported Authentication Methods\n")
+        for method, desc in AUTH_METHODS.items():
+            print(f"  {method:24s}  {desc}")
+        print(f"\n  {len(AUTH_METHODS)} methods supported.\n")
+        sys.exit(0)
+
+    # ── --build-session: test authenticated connectivity ──
+    if args.build_session:
+        method = args.auth_method
+        if not method:
+            print("ERROR: --build-session requires --auth-method")
+            sys.exit(1)
+        if method not in AUTH_METHODS:
+            print(f"ERROR: unknown auth method '{method}'. Use --list-methods to see all.")
+            sys.exit(1)
+        auth_cfg = {
+            "method":               method,
+            "username":             args.username,
+            "password":             args.password,
+            "auth_token":           args.token,
+            "login_url":            args.login_url or args.url,
+            "login_mode":           args.login_mode,
+            "login_username_field": args.login_username_field,
+            "login_password_field": args.login_password_field,
+            "login_token_path":     args.login_token_path,
+            "login_content_type":   args.login_content_type,
+            "api_key":              args.api_key,
+            "api_key_header":       args.api_key_header,
+            "api_key_cookie":       args.api_key_cookie,
+            "totp_secret":          args.totp_secret,
+            "session_cookie":       args.session_cookie,
+            "domain":               args.domain,
+            "_target_url":          args.url,
+        }
+        _console.log(f"Building auth session: method={method}", "INFO")
+        _console.status("build-session", label="AuthProbe",
+                        status="running", step=f"Auth: {method}")
+        sess, info = build_auth_session(
+            auth_cfg,
+            timeout=args.timeout,
+            proxy=args.proxy,
+            verify_ssl=not args.no_verify,
+        )
+        failed = info.startswith("ERROR:")
+        if failed:
+            _console.error(info)
+        else:
+            _console.log(info, "SUCCESS")
+            # Probe the target with the authenticated session
+            _console.log(f"Probing {args.url} with authenticated session...", "INFO")
+            try:
+                resp = sess.get(args.url, timeout=args.timeout)
+                sc = resp.status_code
+                _console.log(f"Authenticated GET {args.url} → HTTP {sc}", "SUCCESS")
+                info += f" | GET {args.url} → HTTP {sc}"
+                if sc in (401, 403):
+                    failed = True
+                    info = f"ERROR: authenticated GET → HTTP {sc} — auth may have failed"
+            except Exception as exc:
+                info += f" | GET failed: {exc}"
+
+        result = {
+            "success": not failed,
+            "message": info,
+            "method":  method,
+            "url":     args.url,
+        }
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            icon = green("✓") if not failed else red("✗")
+            print(f"\n  {icon}  {bold(method)}")
+            print(f"       {info}")
+        _console.status("build-session", label="AuthProbe",
+                        status="complete" if not failed else "error",
+                        step="Done")
+        sys.exit(0 if not failed else 1)
 
     global _PAUSE
     if _pp is not None and args.output_dir:
@@ -2661,6 +3455,9 @@ def main():
         else:
             probe_type = "webapp"
 
+    _console.log(f"Target: {full_url} | Origin: {origin} | Mode: {probe_type}", "INFO")
+    if given_is_login_path:
+        _console.log("Provided URL appears to be a login endpoint — probing directly", "WARNING")
     print(f"  {dim('Target :')} {cyan(full_url)}")
     print(f"  {dim('Origin :')} {cyan(origin)}")
     print(f"  {dim('Mode   :')} {cyan(probe_type)}")
@@ -2693,6 +3490,9 @@ def main():
     }
 
     # Phase 1: Probe the provided URL
+    _console.log(f"[Phase 1/5] Probing target URL: {full_url}", "INFO")
+    _console.status("probe", label="AuthProbe", status="running",
+                    step="Probing target URL", progress=1, total=5)
     print(f"  {dim('[1/5]')} Probing target URL…")
     base_resp = _safe_get(sess := _make_session(args), full_url, args.timeout)
 
@@ -2701,6 +3501,11 @@ def main():
         body = (base_resp.text if base_resp is not None else "")[:8000]
     except Exception:
         pass
+
+    if base_resp is None:
+        _console.error(f"All HTTP probes to {full_url} failed (network/timeout)")
+    else:
+        _console.log(f"[Phase 1/5] Target responded: HTTP {base_resp.status_code}", "SUCCESS")
 
     detect_www_authenticate(base_resp, findings)
     detect_basic_auth(base_resp, findings)
@@ -2711,6 +3516,24 @@ def main():
     detect_session_cookies(base_resp, findings)
     detect_security_headers(base_resp, findings)
 
+    if findings.get("www_authenticate"):
+        _console.log(f"[Phase 1/5] Detected WWW-Authenticate: {[e['scheme'] for e in findings['www_authenticate']]}", "SUCCESS")
+    if findings.get("basic_auth") is not None:
+        _console.log(f"[Phase 1/5] Detected HTTP Basic Auth (realm={findings['basic_auth'].get('realm', '')})", "SUCCESS")
+    if findings.get("ntlm_detected"):
+        _console.log("[Phase 1/5] Detected NTLM authentication", "SUCCESS")
+    if findings.get("kerberos_detected"):
+        _console.log("[Phase 1/5] Detected Kerberos/SPNEGO authentication", "SUCCESS")
+    if findings.get("form_login"):
+        _console.log(f"[Phase 1/5] Detected HTML form-based login ({len(findings.get('form_login_evidence', []))} pattern(s))", "SUCCESS")
+    if findings.get("json_api_auth"):
+        _console.log(f"[Phase 1/5] Detected JSON API auth endpoint: {findings.get('json_api_auth_url', '')}", "SUCCESS")
+    if findings.get("session_cookies"):
+        _console.log(f"[Phase 1/5] Session cookies: {', '.join(findings['session_cookies'][:5])}", "INFO")
+    if findings.get("security_headers"):
+        _console.log(f"[Phase 1/5] Security headers present: {', '.join(findings['security_headers'].keys())}", "INFO")
+    _console.log("[Phase 1/5] Initial probe detection — completed", "SUCCESS")
+
     if given_is_login_path:
         findings["login_endpoints"].append({
             "path": url_path,
@@ -2719,6 +3542,9 @@ def main():
         })
 
     # Phase 2: Software fingerprinting (static HTML)
+    _console.log(f"[Phase 2/5] Fingerprinting software against {full_url}...", "INFO")
+    _console.status("fingerprint", label="AuthProbe", status="running",
+                    step="Software fingerprinting", progress=2, total=5)
     print(f"  {dim('[2/5]')} Fingerprinting software…")
     cookie_names = [c.name for c in (base_resp.cookies if base_resp is not None else [])]
     sw_matches = fingerprint_software(
@@ -2726,6 +3552,7 @@ def main():
     )
 
     if getattr(args, "rendered", False):
+        _console.log("[Phase 2b/5] Rendering page in headless Chrome for SPA fingerprinting...", "INFO")
         print(f"  {dim('[2b/5]')} Rendering page (headless Chrome)…")
         rendered_result = fingerprint_rendered(
             full_url,
@@ -2734,6 +3561,7 @@ def main():
             driver_path=getattr(args, "driver_path", ""),
         )
         if rendered_result.get("error"):
+            _console.log(f"[Phase 2b/5] Rendered analysis failed: {rendered_result['error']}", "WARNING")
             print(f"          {yellow('!')} Rendered analysis: {rendered_result['error']}")
         else:
             r_title   = rendered_result.get("title", "")
@@ -2773,16 +3601,26 @@ def main():
 
     findings["software_matches"] = sw_matches
     if sw_matches:
+        _console.log(f"[Phase 2/5] Identified software: {', '.join(sw['name'] for sw in sw_matches[:3])}", "SUCCESS")
         print(f"          → Identified: {', '.join(sw['name'] for sw in sw_matches[:3])}")
+    else:
+        _console.log("[Phase 2/5] No software fingerprints matched", "INFO")
 
     # Phase 3: Well-known / spec endpoint discovery
+    _console.log(f"[Phase 3/5] Probing well-known endpoints on {origin}...", "INFO")
+    _console.status("well-known", label="AuthProbe", status="running",
+                    step="Well-known endpoint discovery", progress=3, total=5)
     print(f"  {dim('[3/5]')} Probing well-known endpoints…")
     well_known = probe_well_known(sess, full_url, args.timeout)
     findings["well_known"] = well_known
     if well_known:
+        _console.log(f"[Phase 3/5] Found well-known endpoints: {', '.join(well_known.keys())}", "SUCCESS")
         print(f"          → Found: {', '.join(well_known.keys())}")
+    else:
+        _console.log("[Phase 3/5] No well-known endpoints responded", "INFO")
 
     # Phase 3b: /auth-info hint parsing (DV apps and compatible targets)
+    _console.log("[Phase 3b/5] Checking /auth-info endpoint...", "INFO")
     _ai = well_known.get("auth_info", {})
     if _ai.get("status_code") == 200:
         try:
@@ -2796,6 +3634,7 @@ def main():
                     _ai_body.get("fracture_settings", {}).get("scan", {}).get("auth", {})
                 )
                 if _ai_mode:
+                    _console.log(f"[Phase 3b/5] Found auth_info_mode: {_ai_mode}", "SUCCESS")
                     findings["auth_info_mode"] = _ai_mode
                     if _ai_mode == "basic" and findings.get("basic_auth") is None:
                         findings["basic_auth"] = {"realm": ""}
@@ -2818,6 +3657,7 @@ def main():
             pass
 
     # Phase 4: URL type classification
+    _console.log("[Phase 4/5] Classifying URL type...", "INFO")
     # When --type was explicitly specified (not "auto"), trust it directly.
     if args.type != "auto":
         url_type      = args.type
@@ -2828,10 +3668,14 @@ def main():
         )
     findings["url_type"]            = url_type
     findings["url_type_confidence"] = url_type_conf
+    _console.log(f"[Phase 4/5] URL type: {url_type} ({url_type_conf}% confidence)", "SUCCESS")
     colour = green if url_type_conf >= 60 else yellow
     print(f"          → URL type: {colour(url_type)} ({url_type_conf}% confidence)")
 
     # Phase 5: Login endpoint discovery + OAuth/OIDC
+    _console.log(f"[Phase 5a/5] Probing login endpoints from {origin}...", "INFO")
+    _console.status("login-discovery", label="AuthProbe", status="running",
+                    step="Login endpoint discovery", progress=4, total=5)
     print(f"  {dim('[4/5]')} Probing login endpoints from origin…")
     if given_is_login_path:
         root_resp = _safe_get(sess, origin, args.timeout)
@@ -2843,12 +3687,29 @@ def main():
             detect_session_cookies(root_resp, findings)
     detect_login_endpoints(sess, origin, args.timeout, probe_type, skip_paths, findings)
 
+    if findings.get("login_endpoints"):
+        _console.log(f"[Phase 5a/5] Found {len(findings['login_endpoints'])} login endpoint(s): "
+                     f"{', '.join(ep['path'] for ep in findings['login_endpoints'][:5])}", "SUCCESS")
+    else:
+        _console.log("[Phase 5a/5] No login endpoints discovered", "INFO")
+
+    _console.log("[Phase 5b/5] Checking OAuth/OIDC discovery...", "INFO")
+    _console.status("oauth", label="AuthProbe", status="running",
+                    step="OAuth/OIDC discovery", progress=5, total=5)
     print(f"  {dim('[5/5]')} Checking OAuth/OIDC discovery…")
     detect_oauth_discovery(sess, origin, args.timeout, findings)
+    if findings.get("oauth_discovery"):
+        _console.log(f"[Phase 5b/5] Found OAuth/OIDC configuration: "
+                     f"{findings['oauth_discovery'][0].get('issuer', '?')}", "SUCCESS")
+    else:
+        _console.log("[Phase 5b/5] No OAuth/OIDC discovery endpoints found", "INFO")
 
     # Credential validation
     _auth_success = False  # initialised here so protocol-specific blocks below are always valid
     if args.username and args.password:
+        _console.log(f"[Validation] Testing credentials for {args.username} against {full_url}...", "INFO")
+        _console.status("validation", label="AuthProbe", status="running",
+                        step="Credential validation")
         print(f"  {dim('[+]')} Credential validation…")
 
         login_targets = []
@@ -2870,6 +3731,7 @@ def main():
         # jwt_bearer with pre-issued token — validate by making an authenticated request
         _ai_jwt_token = findings.get("auth_info_jwt_token", "") or getattr(args, "token", "")
         if findings.get("auth_info_mode") == "jwt_bearer" and _ai_jwt_token:
+            _console.log("[Validation] Found pre-issued JWT token — testing bearer auth...", "INFO")
             _jwt_probe_paths = ["/api/users", "/api/me", "/users", "/me",
                                 "/api/items", "/profile", "/api/data", "/api/admin"]
             _jwt_ok = False
@@ -2916,6 +3778,7 @@ def main():
         _ai_totp_field  = findings.get("auth_info_totp_field",  "otp")
         if (findings.get("auth_info_mode") == "totp_mfa" and
                 _ai_totp_secret and login_targets):
+            _console.log("[Validation] TOTP MFA mode detected — attempting single-step login...", "INFO")
             _totp_code = _generate_totp(_ai_totp_secret)
             if _totp_code:
                 _totp_done = False
@@ -2967,6 +3830,7 @@ def main():
         if (not _auth_success and
                 findings.get("form_login") and
                 findings.get("auth_info_mode", "") not in _non_form_auth_modes):
+            _console.log("[Validation] Form login detected — testing credentials...", "INFO")
             _form_targets = list(login_targets)
             for ep in findings.get("login_endpoints", []):
                 ep_url = origin.rstrip("/") + ep["path"]
@@ -2976,12 +3840,14 @@ def main():
                 result = validate_form_login(sess, ft, args.username, args.password, args.timeout)
                 findings["validation_results"].append(result)
                 if result.get("success"):
+                    _console.log(f"[Validation] Form login succeeded against {ft}", "SUCCESS")
                     findings["form_login_confirmed_url"] = ft
                     _auth_success = True
                     break
 
         # ── token_login — only if form_login did not succeed ──────────────────
         if not _auth_success:
+            _console.log("[Validation] Testing token/API login...", "INFO")
             for lt in login_targets[:3]:
                 result = validate_token_login(sess, lt, args.username, args.password, args.timeout)
                 findings["validation_results"].append(result)
@@ -2991,6 +3857,7 @@ def main():
                         findings["token_login_url"]    = lt
                         _auth_success = True
                     elif result.get("mfa_required"):
+                        _console.log(f"[Validation] Credentials accepted — MFA challenge issued (types: {result.get('mfa_types', [])})", "SUCCESS")
                         findings["token_login_likely"] = True
                         findings["token_login_url"]    = lt
                         findings["mfa_required"]       = True
@@ -3000,6 +3867,7 @@ def main():
                         if totp_secret and "totp" in [t.lower() for t in result.get("mfa_types", [])]:
                             totp_code = _generate_totp(totp_secret)
                             if totp_code:
+                                _console.log("[Validation] Found TOTP in MFA types — completing TOTP challenge...", "INFO")
                                 print(f"  {dim('[+]')} Completing TOTP MFA challenge…")
                                 _, lt_path, _ = _split_url(lt)
                                 totp_result = complete_totp(
@@ -3040,6 +3908,7 @@ def main():
                             except (EOFError, KeyboardInterrupt):
                                 totp_code = ""
                             if totp_code:
+                                _console.log("[Validation] Submitting user-provided TOTP code...", "INFO")
                                 print(f"  {dim('[+]')} Submitting TOTP code…")
                                 _, lt_path, _ = _split_url(lt)
                                 totp_result = complete_totp(
@@ -3062,10 +3931,14 @@ def main():
 
         # ── basic_auth — only if no method has succeeded yet ─────────────────
         if not _auth_success and findings.get("basic_auth") is not None:
+            _console.log("[Validation] Testing HTTP Basic auth credentials...", "INFO")
             result = validate_basic(sess, full_url, args.username, args.password, args.timeout)
             findings["validation_results"].append(result)
             if result.get("success"):
+                _console.log("[Validation] HTTP Basic auth credentials — valid", "SUCCESS")
                 _auth_success = True
+            else:
+                _console.log("[Validation] HTTP Basic auth credentials — failed", "WARNING")
 
     # ── Protocol-specific credential validation ───────────────────────────────
     _ai_mode_v = findings.get("auth_info_mode", "")
@@ -3077,6 +3950,7 @@ def main():
             (_ai_mode_v == "digest" or
              any(e.get("scheme", "").lower() == "digest"
                  for e in findings.get("www_authenticate", [])))):
+        _console.log("[Validation] Testing Digest auth credentials...", "INFO")
         from requests.auth import HTTPDigestAuth
         _d_auth = HTTPDigestAuth(args.username, args.password)
         _d_added = False
@@ -3102,6 +3976,7 @@ def main():
     # NTLM / NTLMv2 — only if no method has already succeeded
     if (not _auth_success and
             (_ai_mode_v in ("ntlm", "ntlm_v2") or findings.get("ntlm_detected"))):
+        _console.log("[Validation] Testing NTLM credentials...", "INFO")
         try:
             from requests_ntlm import HttpNtlmAuth
             _n_auth = HttpNtlmAuth(args.username, args.password)
@@ -3140,6 +4015,7 @@ def main():
 
     # Kerberos / SPNEGO
     if (_ai_mode_v in ("kerberos", "kerberos_delegation") or findings.get("kerberos_detected")):
+        _console.log("[Validation] Kerberos/SPNEGO detected — not verifiable locally", "WARNING")
         findings["validation_results"].append({
             "method":   _ai_mode_v or "kerberos",
             "success":  None,
@@ -3148,10 +4024,12 @@ def main():
         })
 
     if args.token:
+        _console.log("[Validation] Testing Bearer token...", "INFO")
         findings["validation_results"].append(
             validate_bearer(sess, full_url, args.token, args.timeout))
 
     if args.api_key:
+        _console.log("[Validation] Testing API key (cookie + header)...", "INFO")
         findings["validation_results"].append(
             validate_apikey_cookie(sess, full_url, args.api_key,
                                    args.api_key_cookie, args.timeout))
@@ -3164,9 +4042,12 @@ def main():
     # or html URL type) so we don't waste a GET against pure API endpoints.
     _lp_candidate = None
     if findings.get("form_login") or findings.get("url_type") == "webapp":
+        _console.log("[Profile] Checking Fracture login profile store for structural match...", "INFO")
         try:
             _lp_candidate = _lp_match_from_index(full_url)
             if _lp_candidate:
+                _console.log(f"[Profile] Found matching login profile: {_lp_candidate.get('id', '?')} "
+                             f"(confidence: {_lp_candidate.get('confidence', 0)}%)", "SUCCESS")
                 findings["login_profile_match"] = _lp_candidate
         except Exception:
             pass
@@ -3178,6 +4059,10 @@ def main():
         print(f"\n{dim('─' * 60)}")
         print(f"  {dim('AuthProbe v' + VERSION + ' complete')}")
         print()
+
+    _console.log(f"AuthProbe v{VERSION} probe complete for {full_url}", "SUCCESS")
+    _console.status("complete", label="AuthProbe", status="completed",
+                    step="Probe finished")
 
     if _PAUSE:
         _PAUSE.write_stop_reason("completed", "probe_finished")
@@ -3197,6 +4082,7 @@ def _write_universal_output(out_dir_str: str, target_url: str,
             _s.path.insert(0, "/opt/pr0t31n/shared")
         import pr0t31n_schema as _us
     except ImportError:
+        _console.log("--output-dir given but pr0t31n_schema.py not installed — skipping universal output", "WARNING")
         print(f"  [!] --output-dir given but /opt/pr0t31n/shared/pr0t31n_schema.py "
               f"not installed — skipping universal output.")
         return
@@ -3237,9 +4123,11 @@ def _write_universal_output(out_dir_str: str, target_url: str,
             total_findings=len(unified_findings),
             risk_counts=risk_counts,
         ))
+        _console.log(f"Universal output written to {out_dir} ({len(unified_findings)} findings)", "SUCCESS")
         print(f"\n  {dim('Universal output:')} {cyan(str(out_dir))}")
         print(f"  {dim('  meta.json, findings.json (' + str(len(unified_findings)) + '), summary.json')}")
     except Exception as e:
+        _console.error(f"--output-dir write failed: {e}")
         print(f"  [!] --output-dir write failed: {e}")
 
 
