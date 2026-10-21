@@ -303,6 +303,109 @@ _WEBAPP_URL_SIGNALS = [
     r"/portal", r"/user/", r"/account", r"/wp-login", r"/wp-admin",
 ]
 
+# SPA root markers — React, Vue, Next.js, Nuxt, Gatsby, Angular, Blazor
+_SPA_ROOT_RE = re.compile(
+    r'<div\s+id=["\']('
+    r'root|app|__next|__nuxt|___gatsby'
+    r'|angular-app|blazor-app|main-app'
+    r')["\']',
+    re.I,
+)
+
+# JS source patterns that reveal auth/login URLs
+_JS_API_URL_PAT = re.compile(
+    r'(?:ApiLoginUrl|loginUrl|authUrl|login_url|auth_url'
+    r'|signInUrl|tokenUrl|token_url|authEndpoint|loginEndpoint)'
+    r'\s*[=:]\s*["\']([^"\']+)["\']',
+    re.I,
+)
+
+_JS_API_PATH_PAT = re.compile(
+    r'(?:href|action|src)\s*=\s*["\']([^"\']*'
+    r'(?:/api/(?:login|auth|token|signin|session)'
+    r'|/connect/token|/oauth/token)[^"\']*)["\']',
+    re.I,
+)
+
+_JS_AUTH_URL_PAT = re.compile(
+    r'["\'](/(?:[^"\'\s/]+/)*'
+    r'(?:token|login|auth(?:enticate)?'
+    r'|sign[_\-]?in|sessions?'
+    r'|connect/token|oauth/token'
+    r'|account/login|identity/token)'
+    r'(?:/[^"\'\s]*)?)["\']',
+    re.I,
+)
+
+_JS_FETCH_URL_PAT = re.compile(
+    r'(?:fetch|\.post|\.get|\.put|\.request)\s*\(\s*'
+    r'["\']([^"\']+)["\']',
+    re.I,
+)
+
+_JS_STATIC_EXT = re.compile(r'\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map)$', re.I)
+
+# Global config objects that hold API base URLs
+_JS_API_BASE_PAT = re.compile(
+    r'(?:ApiUrl|apiUrl|ApiBase|apiBase|apiBaseUrl'
+    r'|ApiBaseUrl|baseApiUrl|BaseApiUrl|serviceUrl'
+    r'|ServiceUrl|ServerUrl|serverUrl'
+    r'|baseUrl|BaseUrl|ClientApiUrl|clientApiUrl'
+    r'|apiHost|ApiHost|apiRoot|ApiRoot'
+    r'|REACT_APP_API_URL|VUE_APP_API_URL)'
+    r'\s*[=:]\s*["\']([^"\']+)["\']',
+    re.I,
+)
+
+_JS_CONFIG_OBJ_PAT = re.compile(
+    r'(?:(?:window|global)\.(\w+)\s*=\s*\{'
+    r'|(?:const|var|let)\s+(\w+)\s*=\s*\{)'
+    r'([^}]{10,8000})\}',
+)
+
+_AUTH_SUFFIXES = (
+    "/Login", "/login", "/Token", "/token",
+    "/Account/Login", "/account/login",
+    "/Account/Authenticate", "/account/authenticate",
+    "/Auth/Login", "/auth/login",
+    "/Auth/Token", "/auth/token",
+    "/Auth/Authenticate", "/auth/authenticate",
+    "/Authenticate", "/authenticate",
+    "/Session", "/session",
+    "/Users/Login", "/users/login",
+    "/Identity/Token", "/identity/token",
+    "/Connect/Token", "/connect/token",
+    "/Security/Login", "/security/login",
+)
+
+# AWS SigV4 detection patterns
+_AWS_HEADER_RE = re.compile(r'^x-amz', re.I)
+_AWS_HOST_RE = re.compile(r'\.amazonaws\.com|\.awsapps\.com|\.api\.aws', re.I)
+_AWS_SERVER_RE = re.compile(r'AmazonS3|awselb|CloudFront|Amazon', re.I)
+_AWS_XML_ERROR_RE = re.compile(
+    r'<Code>(?:SignatureDoesNotMatch|MissingAuthenticationToken|'
+    r'InvalidSignatureException|AccessDenied)</Code>', re.I,
+)
+
+# HMAC signature detection patterns
+_HMAC_HEADER_RE = re.compile(
+    r'^(?:X-Signature|X-HMAC|X-Hub-Signature|X-Content-Signature)$', re.I,
+)
+_HMAC_AUTH_RE = re.compile(r'^(?:HMAC|Signature|hmac|signature)\s', re.I)
+_HMAC_BODY_RE = re.compile(
+    r'(?:signature|hmac|signing.?key|invalid.?signature|'
+    r'signature.?mismatch|signed.?request)', re.I,
+)
+
+# JWT structure detection
+_JWT_SHAPE_RE = re.compile(r'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}')
+
+# API key error body patterns
+_APIKEY_BODY_RE = re.compile(
+    r'(?:api[_ ]?key|apikey|x-api-key|subscription[_ ]?key|'
+    r'invalid.?api.?key|missing.?api.?key|api.?key.?required)', re.I,
+)
+
 # ─────────────────────────────────────────────────────────────
 # Software fingerprint database
 # ─────────────────────────────────────────────────────────────
@@ -1751,6 +1854,193 @@ def detect_login_endpoints(sess, origin: str, timeout: int, probe_type: str,
         _console.log("[login-discovery] No additional login endpoints found", "INFO")
 
 
+def _scan_source_for_auth_urls(text: str, base_url: str) -> list[str]:
+    """Extract auth-related URLs from JS source or HTML using Fracture-derived patterns."""
+    found = set()
+    for pat in (_JS_API_URL_PAT, _JS_API_PATH_PAT, _JS_AUTH_URL_PAT, _JS_FETCH_URL_PAT):
+        for m in pat.finditer(text):
+            raw = m.group(1).strip()
+            if _JS_STATIC_EXT.search(raw):
+                continue
+            try:
+                resolved = urljoin(base_url, raw)
+                found.add(resolved)
+            except Exception:
+                pass
+    return list(found)
+
+
+def _mine_api_base_urls(text: str) -> list[str]:
+    """Extract API base URLs from global config objects in JS source."""
+    bases = set()
+    for m in _JS_API_BASE_PAT.finditer(text):
+        url = m.group(1).strip().rstrip("/")
+        if url.startswith(("http://", "https://", "//")):
+            bases.add(url)
+    for m in _JS_CONFIG_OBJ_PAT.finditer(text):
+        config_body = m.group(3) or ""
+        for prop_m in re.finditer(
+            r'["\']?(\w*(?:api|service|auth)\w*)["\']?\s*[=:]\s*["\']'
+            r'(https?://[^"\']+)["\']',
+            config_body, re.I,
+        ):
+            bases.add(prop_m.group(2).strip().rstrip("/"))
+    return list(bases)
+
+
+def detect_spa_framework(body: str, findings: dict):
+    """Detect SPA root markers in baseline HTML."""
+    m = _SPA_ROOT_RE.search(body)
+    if m:
+        findings["spa_root_detected"] = True
+        marker = m.group(1).lower()
+        framework_map = {
+            "root": "React", "app": "Vue/Generic", "__next": "Next.js",
+            "__nuxt": "Nuxt", "___gatsby": "Gatsby",
+            "angular-app": "Angular", "blazor-app": "Blazor",
+            "main-app": "Generic SPA",
+        }
+        findings["spa_framework"] = framework_map.get(marker, "Unknown SPA")
+        findings["spa_marker_tag"] = m.group(0)
+
+
+def detect_js_bundle_auth_urls(sess, body: str, base_url: str, timeout: int,
+                                findings: dict):
+    """Scan JS bundles linked from the page for auth/login URL patterns."""
+    script_re = re.compile(r'<script[^>]+src=["\']([^"\']+\.js(?:\?[^"\']*)?)["\']', re.I)
+    script_urls = script_re.findall(body)[:10]
+    if not script_urls:
+        return
+
+    _console.log(f"[js-mining] Scanning {len(script_urls)} JS bundle(s)...", "INFO")
+    all_auth_urls = []
+    all_api_bases = []
+
+    for src in script_urls:
+        try:
+            js_url = urljoin(base_url, src)
+            r = sess.get(js_url, timeout=timeout, stream=True)
+            if r.status_code != 200:
+                continue
+            js_body = r.content[:3_145_728].decode("utf-8", errors="replace")
+            auth_urls = _scan_source_for_auth_urls(js_body, base_url)
+            all_auth_urls.extend(auth_urls)
+            api_bases = _mine_api_base_urls(js_body)
+            all_api_bases.extend(api_bases)
+        except Exception:
+            continue
+
+    page_auth_urls = _scan_source_for_auth_urls(body, base_url)
+    all_auth_urls.extend(page_auth_urls)
+
+    for api_base in all_api_bases:
+        for suffix in _AUTH_SUFFIXES:
+            candidate = api_base.rstrip("/") + suffix
+            all_auth_urls.append(candidate)
+
+    seen = set()
+    deduped = []
+    for u in all_auth_urls:
+        if u not in seen:
+            seen.add(u)
+            deduped.append(u)
+
+    if deduped:
+        _console.log(f"[js-mining] Found {len(deduped)} auth URL candidate(s) from JS", "SUCCESS")
+    findings["js_bundle_login_urls"] = deduped
+    findings["api_base_urls"] = list(set(all_api_bases))
+
+
+def detect_hmac_signature(resp, url: str, findings: dict):
+    """Detect HMAC signature auth from response headers and error body."""
+    if resp is None:
+        return
+    www_auth = resp.headers.get("WWW-Authenticate", "")
+    if _HMAC_AUTH_RE.match(www_auth):
+        findings["hmac_signature_hints"].append(f"WWW-Authenticate: {www_auth[:80]}")
+    for h in resp.headers:
+        if _HMAC_HEADER_RE.match(h):
+            findings["hmac_signature_hints"].append(f"Header present: {h}")
+    if resp.status_code in (401, 403):
+        body_text = resp.text[:4000] if resp.text else ""
+        if _HMAC_BODY_RE.search(body_text):
+            findings["hmac_signature_hints"].append("Error body references signature/HMAC")
+
+
+def detect_aws_sigv4(resp, url: str, findings: dict):
+    """Detect AWS SigV4 auth from response headers, hostname, and error body."""
+    if resp is None:
+        return
+    parsed = urlparse(url)
+    if _AWS_HOST_RE.search(parsed.netloc):
+        findings["aws_sigv4_detected"] = True
+        findings["aws_sigv4_hints"].append(f"AWS hostname: {parsed.netloc}")
+    for h, v in resp.headers.items():
+        if _AWS_HEADER_RE.match(h):
+            findings["aws_sigv4_detected"] = True
+            findings["aws_sigv4_hints"].append(f"AWS header: {h}")
+            break
+    server = resp.headers.get("Server", "")
+    if _AWS_SERVER_RE.search(server):
+        findings["aws_sigv4_detected"] = True
+        findings["aws_sigv4_hints"].append(f"Server: {server}")
+    www_auth = resp.headers.get("WWW-Authenticate", "")
+    if "aws" in www_auth.lower() or "AWS4-HMAC-SHA256" in www_auth:
+        findings["aws_sigv4_detected"] = True
+        findings["aws_sigv4_hints"].append(f"WWW-Authenticate: {www_auth[:80]}")
+    if resp.status_code in (401, 403):
+        body_text = resp.text[:4000] if resp.text else ""
+        if _AWS_XML_ERROR_RE.search(body_text):
+            findings["aws_sigv4_detected"] = True
+            findings["aws_sigv4_hints"].append("AWS XML error body")
+    if resp.headers.get("x-amzn-errortype"):
+        findings["aws_sigv4_detected"] = True
+        findings["aws_sigv4_hints"].append(f"x-amzn-errortype: {resp.headers['x-amzn-errortype']}")
+
+
+def detect_jwt_patterns(resp, well_known: dict, findings: dict):
+    """Detect JWT-shaped tokens in responses and well-known endpoint data."""
+    if resp is not None and resp.text:
+        body_text = resp.text[:8000]
+        if _JWT_SHAPE_RE.search(body_text):
+            findings["jwt_patterns"].append("JWT-shaped token in response body")
+    for wk_key, wk_info in well_known.items():
+        snip = wk_info.get("body_snip", "")
+        if _JWT_SHAPE_RE.search(snip):
+            findings["jwt_patterns"].append(f"JWT-shaped token in {wk_key}")
+        if '"token_type"' in snip.lower() and '"bearer"' in snip.lower():
+            findings["jwt_patterns"].append(f"Bearer token_type in {wk_key}")
+
+
+def detect_apikey_unified(resp, well_known: dict, findings: dict):
+    """Detect unified API key auth (header + query param) from error bodies and specs."""
+    if resp is not None and resp.status_code in (401, 403):
+        body_text = resp.text[:4000] if resp.text else ""
+        if _APIKEY_BODY_RE.search(body_text):
+            findings["apikey_unified_hints"].append("Error body references API key")
+    for wk_key in ("openapi_json", "swagger_json", "v3_api_docs"):
+        wk_info = well_known.get(wk_key, {})
+        snip = wk_info.get("body_snip", "").lower()
+        if '"apikey"' in snip and '"in"' in snip:
+            if '"query"' in snip:
+                findings["apikey_unified_hints"].append(f"OpenAPI spec: apiKey in query ({wk_key})")
+            if '"header"' in snip:
+                findings["apikey_unified_hints"].append(f"OpenAPI spec: apiKey in header ({wk_key})")
+
+
+def detect_oauth2_password_grant(well_known: dict, oauth_discovery: list, findings: dict):
+    """Detect OAuth2 password (ROPC) grant support from OIDC discovery."""
+    for entry in oauth_discovery:
+        pass
+    for wk_key in ("openid_configuration", "oauth_server"):
+        wk_info = well_known.get(wk_key, {})
+        snip = wk_info.get("body_snip", "")
+        if '"password"' in snip and "grant_types" in snip:
+            findings["oauth2_password_likely"] = True
+            findings["oauth2_password_hints"].append(
+                f"OIDC discovery lists 'password' grant ({wk_key})")
+
+
 # ─────────────────────────────────────────────────────────────
 # Credential validation
 # ─────────────────────────────────────────────────────────────
@@ -2950,6 +3240,20 @@ class AuthProbe:
             "auth_info_mode":        "",
             "url_type":              "unknown",
             "url_type_confidence":   0,
+            # JS bundle mining + SPA detection (Fracture-derived)
+            "spa_root_detected":     False,
+            "spa_framework":         "",
+            "spa_marker_tag":        "",
+            "js_bundle_login_urls":  [],
+            "api_base_urls":         [],
+            # API-specific method detection (Siphon-derived)
+            "hmac_signature_hints":  [],
+            "aws_sigv4_detected":    False,
+            "aws_sigv4_hints":       [],
+            "jwt_patterns":          [],
+            "apikey_unified_hints":  [],
+            "oauth2_password_likely": False,
+            "oauth2_password_hints": [],
         }
 
         raw_url = url.rstrip("/")
@@ -2994,6 +3298,12 @@ class AuthProbe:
         detect_session_cookies(base_resp, findings)
         detect_apikey_cookie(base_resp, findings)
         detect_security_headers(base_resp, findings)
+
+        # Phase 2b: API-specific auth detection (Siphon-derived)
+        detect_hmac_signature(base_resp, full_url, findings)
+        detect_aws_sigv4(base_resp, full_url, findings)
+        detect_jwt_patterns(base_resp, {}, findings)
+        detect_apikey_unified(base_resp, {}, findings)
 
         # Phase 3: Software fingerprinting (static HTML)
         _console.log("[probe] Phase 3: Software fingerprinting...", "INFO")
@@ -3086,6 +3396,45 @@ class AuthProbe:
         findings["url_type"]              = url_type
         findings["url_type_confidence"]   = url_type_conf
         _console.log(f"[probe] Phase 5: URL type: {url_type} ({url_type_conf}%)", "SUCCESS")
+
+        # Phase 5b: JS bundle mining + SPA detection (Fracture-derived)
+        if url_type in ("webapp", "hybrid", "unknown"):
+            _console.log("[probe] Phase 5b: JS bundle mining + SPA detection...", "INFO")
+            detect_spa_framework(body, findings)
+            if findings.get("spa_root_detected"):
+                _console.log(f"[probe] Phase 5b: SPA framework: {findings['spa_framework']}", "SUCCESS")
+            detect_js_bundle_auth_urls(sess, body, full_url, self.timeout, findings)
+            js_urls = findings.get("js_bundle_login_urls", [])
+            if js_urls:
+                _console.log(f"[probe] Phase 5b: {len(js_urls)} auth URL(s) from JS bundles", "SUCCESS")
+                spa_marker = findings.get("spa_marker_tag", "")
+                for js_url in js_urls[:30]:
+                    try:
+                        probe_r = _safe_get(sess, js_url, self.timeout)
+                        if probe_r is None or probe_r.status_code == 404:
+                            continue
+                        ct = probe_r.headers.get("Content-Type", "").lower()
+                        if "html" in ct and spa_marker and spa_marker in (probe_r.text or "")[:8000]:
+                            continue
+                        if probe_r.status_code in (200, 301, 302, 400, 401, 403, 405, 422):
+                            existing = {ep["path"] for ep in findings["login_endpoints"]}
+                            ep_path = urlparse(js_url).path
+                            if ep_path not in existing:
+                                findings["login_endpoints"].append({
+                                    "path": ep_path,
+                                    "status": probe_r.status_code,
+                                    "content_type": ct[:60],
+                                    "source": "js_bundle",
+                                })
+                            detect_json_api_auth(probe_r, js_url, findings)
+                            detect_token_login_response(probe_r, js_url, findings)
+                    except Exception:
+                        continue
+
+        # Phase 5c: Re-run API-specific detection with well-known data
+        detect_jwt_patterns(None, well_known, findings)
+        detect_apikey_unified(None, well_known, findings)
+        detect_oauth2_password_grant(well_known, findings.get("oauth_discovery", []), findings)
 
         # Phase 6: Login endpoint discovery
         _console.log("[probe] Phase 6: Login endpoint discovery...", "INFO")
@@ -3230,6 +3579,55 @@ class AuthProbe:
             for m in sw.get("auth_hints", []):
                 delta = max(20, sw["confidence"] // 2)
                 _add(m, delta, f"{sw['name']} fingerprint (conf {sw['confidence']}%)")
+
+        # JS bundle mining signals (Fracture-derived)
+        js_urls = findings.get("js_bundle_login_urls", [])
+        if js_urls:
+            js_ep_count = sum(1 for ep in findings.get("login_endpoints", [])
+                              if ep.get("source") == "js_bundle")
+            if js_ep_count:
+                _add("token_login", 55, f"{js_ep_count} login endpoint(s) from JS bundles")
+        if findings.get("api_base_urls"):
+            _add("token_login", 35, f"API base URL(s) in JS: {len(findings['api_base_urls'])}")
+        if findings.get("spa_root_detected"):
+            framework = findings.get("spa_framework", "SPA")
+            _add("token_login", 40, f"SPA detected: {framework}")
+            _add("bearer", 30, f"SPA ({framework}) conventionally uses Bearer")
+
+        # HMAC signature detection (Siphon-derived)
+        if findings.get("hmac_signature_hints"):
+            hints = findings["hmac_signature_hints"]
+            _add("hmac_signature", 65, "; ".join(hints[:2]))
+
+        # AWS SigV4 detection (Siphon-derived)
+        if findings.get("aws_sigv4_detected"):
+            hints = findings.get("aws_sigv4_hints", [])
+            _add("aws_sigv4", 75, "; ".join(hints[:2]))
+
+        # JWT bearer detection (Siphon-derived)
+        if findings.get("jwt_patterns"):
+            hints = findings["jwt_patterns"]
+            _add("jwt_bearer", 60, "; ".join(hints[:2]))
+            existing_bearer = scores.get("bearer", {}).get("confidence", 0)
+            if existing_bearer > 0:
+                _add("jwt_bearer", 15, "Bearer + JWT structure → jwt_bearer likely")
+
+        # Unified API key (header + query) detection (Siphon-derived)
+        if findings.get("apikey_unified_hints"):
+            hints = findings["apikey_unified_hints"]
+            _add("apikey", 55, "; ".join(hints[:2]))
+
+        # OAuth2 password grant detection (Siphon-derived)
+        if findings.get("oauth2_password_likely"):
+            hints = findings.get("oauth2_password_hints", [])
+            _add("oauth2_password", 60, "; ".join(hints[:2]) if hints else "OIDC password grant")
+
+        # Cookie login — when login endpoints accept JSON and return cookies, no CSRF
+        json_login_eps = [ep for ep in findings.get("login_endpoints", [])
+                          if "json" in ep.get("content_type", "").lower()
+                          and ep.get("status") in (200, 400, 401, 403, 422)]
+        if json_login_eps and findings.get("session_cookies") and not findings.get("form_login"):
+            _add("cookie_login", 45, "JSON login endpoint + session cookies, no HTML form")
 
         # Default fallbacks
         url_type = findings.get("url_type", "unknown")
