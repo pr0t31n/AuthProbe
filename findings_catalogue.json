@@ -13,7 +13,7 @@
       "source_tools": [
         "authprobe"
       ],
-      "risk": "",
+      "risk": "INFO",
       "cwe": [],
       "cve_examples": [],
       "cvss_v3_base": null,
@@ -52,7 +52,7 @@
       "source_tools": [
         "authprobe"
       ],
-      "risk": "",
+      "risk": "LOW",
       "cwe": [],
       "cve_examples": [],
       "cvss_v3_base": null,
@@ -91,7 +91,7 @@
       "source_tools": [
         "authprobe"
       ],
-      "risk": "",
+      "risk": "MEDIUM",
       "cwe": [],
       "cve_examples": [],
       "cvss_v3_base": null,
