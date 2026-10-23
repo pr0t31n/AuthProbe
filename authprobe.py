@@ -4545,7 +4545,7 @@ def _authprobe_findings_to_universal(findings: dict, target_url: str) -> list:
     out.append({
         "id":          "",
         "tool":        "authprobe",
-        "title":       f"Discovery: AuthProbe Discovery: {host}",
+        "title":       "Discovery: Authentication Endpoint Detected",
         "datetime":    "",
         "ip":          host, "port": port, "hostname": host,
         "risk":        "INFO",

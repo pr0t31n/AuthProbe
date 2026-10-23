@@ -8,7 +8,7 @@
   "findings": [
     {
       "id": "AP-001",
-      "title": "Discovery: AuthProbe Discovery: {host}",
+      "title": "Discovery: Authentication Endpoint Detected",
       "aliases": [],
       "source_tools": [
         "authprobe"
