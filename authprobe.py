@@ -4545,7 +4545,7 @@ def _authprobe_findings_to_universal(findings: dict, target_url: str) -> list:
     out.append({
         "id":          "",
         "tool":        "authprobe",
-        "title":       f"AuthProbe Discovery: {host}",
+        "title":       f"Discovery: AuthProbe Discovery: {host}",
         "datetime":    "",
         "ip":          host, "port": port, "hostname": host,
         "risk":        "INFO",
@@ -4596,7 +4596,7 @@ def _authprobe_findings_to_universal(findings: dict, target_url: str) -> list:
     if findings.get("basic_auth"):
         out.append({
             "id": "", "tool": "authprobe",
-            "title":       "HTTP Basic Authentication in Use",
+            "title":       "Authentication: HTTP Basic Authentication in Use",
             "datetime":    "",
             "ip": host, "port": port, "hostname": host,
             "risk": "MEDIUM",

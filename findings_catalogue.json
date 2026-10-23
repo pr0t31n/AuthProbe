@@ -8,7 +8,7 @@
   "findings": [
     {
       "id": "AP-001",
-      "title": "AuthProbe Discovery: {host}",
+      "title": "Discovery: AuthProbe Discovery: {host}",
       "aliases": [],
       "source_tools": [
         "authprobe"
@@ -86,7 +86,7 @@
     },
     {
       "id": "AP-003",
-      "title": "HTTP Basic Authentication in Use",
+      "title": "Authentication: HTTP Basic Authentication in Use",
       "aliases": [],
       "source_tools": [
         "authprobe"
