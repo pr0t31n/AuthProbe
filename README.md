@@ -47,6 +47,9 @@ Security testing is a professional discipline with significant ethical and legal
 
 Authentication detection and probing tool for web applications and APIs. Identifies authentication methods, fingerprints software platforms, discovers login endpoints, and optionally validates credentials — all from a single URL.
 
+
+> **[View full documentation on the Codex Wiki](https://wiki.pr0t31n.com/tools/authprobe)** — detailed features, CLI reference, findings catalogue, and integration guides.
+
 ## Features
 
 - **8-phase probe pipeline**: primary URL → auth signal detection → software fingerprinting → well-known endpoint discovery → URL type classification → JS bundle mining + SPA detection → login endpoint discovery → confidence-scored recommendations
